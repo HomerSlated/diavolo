@@ -6,7 +6,14 @@ measured" item in brief PART 12. It also corrects one claim in PART 4 gap 3.
 ## Setup
 
 - `tools/dump-deletion-test.sh` was run as root by kgr.
-- `/usr/local/sbin/{dump,restore}` 0.4b52, with libext2fs 1.47.2.
+- `/usr/local/sbin/{dump,restore}` **0.4b56**, with libext2fs 1.47.2.
+  - **Not 0.4b52.** The brief and an earlier version of this note both say 0.4b52.
+    That was true at 15:25, but the binaries were replaced at 16:27–16:29, before the
+    17:31 run.
+  - The new binaries report the same version as kgr's clone in `private/code/dump-code`
+    (HEAD `9e6f839`, "Make 0.4b56 release", built 16:22). That is consistent with them
+    being built from it. It is not proven: the installed binaries are smaller than
+    the ones in the build tree, which fits stripping but was not verified.
 - Two 64 MiB ext4 loop filesystems, each dump taken with the source remounted
   read-only.
 - A level 0 dump, then these mutations, then a level 1 dump:
@@ -39,6 +46,12 @@ vacuously. Run A closes that hole.
   `restoresymtable` is a hard error. It becomes silent only if the operator reacts by
   switching to `-x`, and that is failure mode 1. The 0.4b56 source agrees:
   `initsymtable()` calls `errx(1, …)` when the file cannot be opened.
+- **All of the above is measured on 0.4b56 only.** Whether 0.4b52 behaves the same
+  way is unmeasured, and its binary is gone. Two things still depend on 0.4b52:
+  - the `strings` evidence in SOLUTIONS.md was taken from it;
+  - the real 233 GiB chain was *written* by it.
+
+  Restoring that chain with 0.4b56 is a cross-version restore that nobody has tested.
   - There is a silent variant this test does **not** cover: a pass run from a cwd
     that contains a *different* `restoresymtable`. It is unmeasured.
 - **Modes 1 and 3 are confirmed silent**, exactly as described.
