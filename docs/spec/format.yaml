@@ -1,7 +1,349 @@
 # Diavolo archive format — THE authoritative specification.
 #
-# UNSTABLE until v0.1.0. Archives written before then may become unreadable, and
-# every reader refuses any format version it does not explicitly recognise.
+# UNSTABLE until Diavolo v0.1.0. Archives written before then may become
+# unreadable, and every reader refuses any format version it does not
+# explicitly recognise (see `acceptance`).
 #
-# This file is the only input the generator reads, together with the files it
+# The generator (`cargo xtask codegen`) reads this file and the files it
 # declares under `inputs:`. Any other file in docs/spec/ is an error.
+# Reasons for the decisions encoded here: docs/design/0001-archive-layout.md.
+
+spec_schema: 1          # vocabulary version of THIS YAML; the generator refuses others
+format_version: { major: 0, minor: 1 }
+status: UNSTABLE
+
+inputs:
+  - rules.yaml
+  - corpus.yaml
+
+endianness: little
+offset_origin: "byte 0 of the archive file"   # every *_offset field below, unless stated
+
+# ---------------------------------------------------------------------------
+# Version acceptance. A reader built from this spec accepts exactly the rows
+# listed; every other (major, minor) is rejected with rule
+# header.version_unsupported. Major 0 is the UNSTABLE series: every minor is
+# a breaking change.
+# ---------------------------------------------------------------------------
+acceptance:
+  rows:
+    - { file_major: 0, file_minor: 1, verdict: accept }
+  otherwise: reject
+
+constants:
+  - { name: MAX_CHUNK_RAW,   value: 1048576,    doc: "Largest raw (uncompressed) length of one extent / DATA block, bytes." }
+  - { name: NSEC_LIMIT,      value: 1000000000, doc: "Every *_nsec field MUST be strictly less than this." }
+  - { name: NAME_MAX,        value: 255,        doc: "Longest dirent name, bytes." }
+  - { name: XATTR_NAME_MAX,  value: 255,        doc: "Longest xattr name, bytes." }
+  - { name: XATTR_VALUE_MAX, value: 65536,      doc: "Longest xattr value, bytes." }
+  - { name: SYMLINK_MAX,     value: 4095,       doc: "Longest symlink target, bytes." }
+
+magics:
+  - { name: HEADER_MAGIC,  bytes: [0x89, 0x44, 0x56, 0x4C, 0x0D, 0x0A, 0x1A, 0x0A], doc: "\\x89 D V L \\r \\n \\x1a \\n" }
+  - { name: TRAILER_MAGIC, bytes: [0x89, 0x44, 0x56, 0x54, 0x0D, 0x0A, 0x1A, 0x0A], doc: "\\x89 D V T \\r \\n \\x1a \\n" }
+
+# ---------------------------------------------------------------------------
+# Enumerations. Value 0 is `invalid` in every enum, and a value not listed is
+# rejected. "Not recorded" is never encoded as 0 of some other enum.
+# ---------------------------------------------------------------------------
+enums:
+  - name: codec
+    width: u16
+    values:
+      - { name: invalid, value: 0, doc: "Never valid." }
+      - { name: stored,  value: 1, doc: "Payload bytes are the raw bytes." }
+      - { name: zstd,    value: 2, doc: "Payload bytes are one RFC 8878 zstd frame decoding to the raw bytes." }
+  - name: index_codec
+    width: u16
+    values:
+      - { name: invalid, value: 0, doc: "Never valid." }
+      - { name: stored,  value: 1, doc: "Index tables follow the index header uncompressed." }
+  - name: source_fs
+    width: u16
+    values:
+      - { name: invalid, value: 0, doc: "Never valid." }
+      - { name: ext4,    value: 1, doc: "Linux ext2/3/4, read via libext2fs. fs_flags are ext4 i_flags." }
+  - name: content_kind
+    width: u16
+    values:
+      - { name: invalid,   value: 0, doc: "Never valid." }
+      - { name: none,      value: 1, doc: "Type has no content: directory, device, FIFO, socket." }
+      - { name: extents,   value: 2, doc: "Regular file whose content is the extents in THIS archive; uncovered bytes are zero." }
+      - { name: inherited, value: 3, doc: "Regular file whose content is that of the same ino in chain entry chain_ref." }
+      - { name: symlink,   value: 4, doc: "Symbolic link; target is heap bytes [target_off, target_off + size)." }
+      - { name: excluded,  value: 5, doc: "Regular file deliberately not captured. NOT a deletion. Metadata is valid; content is absent." }
+  - name: completeness
+    width: u16
+    values:
+      - { name: invalid,  value: 0, doc: "Never valid." }
+      - { name: complete, value: 1, doc: "The directory's dirent range is its entire entry list at capture time." }
+      - { name: partial,  value: 2, registered_undefined: true, doc: "Reserved for a partial list plus tombstones. MUST NOT be written in 0.x; a reader rejects it." }
+  - name: file_type
+    width: u32
+    mask: 0xF000           # applied to inode.mode
+    values:
+      - { name: invalid, value: 0x0000, doc: "Never valid." }
+      - { name: fifo,    value: 0x1000, doc: "S_IFIFO" }
+      - { name: chr,     value: 0x2000, doc: "S_IFCHR" }
+      - { name: dir,     value: 0x4000, doc: "S_IFDIR" }
+      - { name: blk,     value: 0x6000, doc: "S_IFBLK" }
+      - { name: reg,     value: 0x8000, doc: "S_IFREG" }
+      - { name: lnk,     value: 0xA000, doc: "S_IFLNK" }
+      - { name: sock,    value: 0xC000, doc: "S_IFSOCK" }
+
+# Which content_kind each file_type admits (rule inode.content_kind_for_type).
+content_kind_by_type:
+  fifo: [none]
+  chr:  [none]
+  dir:  [none]
+  blk:  [none]
+  reg:  [extents, inherited, excluded]
+  lnk:  [symlink]
+  sock: [none]
+
+# ---------------------------------------------------------------------------
+# Flag sets. Every set here follows the even/odd convention: an unknown bit at
+# an EVEN position is ignored; an unknown bit at an ODD position rejects the
+# file (the set's `unknown_odd_rule`).
+# ---------------------------------------------------------------------------
+flag_sets:
+  - name: header_flags
+    width: u32
+    unknown_odd_rule: header.flags_unknown_odd
+    bits: []
+  - name: trailer_flags
+    width: u32
+    unknown_odd_rule: trailer.flags_unknown_odd
+    bits: []
+  - name: block_flags
+    width: u32
+    unknown_odd_rule: block.flags_unknown_odd
+    bits:
+      - { bit: 0, name: skip, doc: "Optional block: a reader that does not know type_id ignores it. MUST NOT be set on DATA or INDX." }
+  - name: capabilities
+    width: u32
+    unknown_odd_rule: index.capabilities_unknown_odd
+    bits:
+      - { bit: 0, name: xattrs,   doc: "Writer read extended attributes of every inode." }
+      - { bit: 1, name: fs_flags, doc: "Writer recorded fs_flags of every inode." }
+      - { bit: 2, name: crtime,   doc: "Writer recorded crtime of every inode whose source has one." }
+  - name: present
+    width: u32
+    unknown_odd_rule: inode.present_unknown_odd
+    bits:
+      - { bit: 0, name: nsec,   doc: "The four *_nsec fields are recorded. If clear they MUST be 0 and mean 'not recorded', not 'zero'." }
+      - { bit: 1, name: crtime, doc: "crtime_sec/crtime_nsec are recorded. If clear they MUST be 0." }
+
+# ---------------------------------------------------------------------------
+# Block type ids (4 ASCII bytes).
+# ---------------------------------------------------------------------------
+block_types:
+  - { id: DATA, status: defined,              doc: "One chunk of one regular file's content." }
+  - { id: INDX, status: defined,              doc: "The index. Exactly one, immediately before the trailer." }
+  - { id: CRYP, status: registered_undefined, doc: "Encrypted segment. MUST NOT be written until defined." }
+  - { id: KDFP, status: registered_undefined, doc: "Key-derivation parameters. MUST NOT be written until defined." }
+  - { id: PAR2, status: registered_undefined, doc: "Recovery data. MUST NOT be written until defined." }
+  - { id: PACK, status: registered_undefined, doc: "Several files' chunks in one block. MUST NOT be written until defined." }
+
+# ---------------------------------------------------------------------------
+# Fixed layouts. Field offsets MUST tile the record exactly (the generator
+# checks: no gap, no overlap, sum == size). Types: u16 u32 u64 i64 bytesN.
+#   enum: <name>     value constrained by an enum
+#   flags: <name>    value is a flag set
+#   reserved: true   MUST be zero (rule record.reserved_nonzero)
+#   heap_refs        pairs of (offset field, length field) addressing the heap
+# ---------------------------------------------------------------------------
+layouts:
+  - name: header
+    size: 32
+    doc: "At offset 0. Written first, never rewritten."
+    fields:
+      - { off: 0,  name: magic,        type: bytes8,  doc: "HEADER_MAGIC." }
+      - { off: 8,  name: format_major, type: u16,     doc: "See acceptance." }
+      - { off: 10, name: format_minor, type: u16,     doc: "See acceptance." }
+      - { off: 12, name: header_flags, type: u32,     flags: header_flags }
+      - { off: 16, name: archive_uuid, type: bytes16, doc: "Random (v4) UUID naming this archive." }
+
+  - name: trailer
+    size: 160
+    doc: "The last 160 bytes of the file. The root of trust."
+    fields:
+      - { off: 0,   name: magic,               type: bytes8,  doc: "TRAILER_MAGIC." }
+      - { off: 8,   name: format_major,        type: u16,     doc: "== header.format_major." }
+      - { off: 10,  name: format_minor,        type: u16,     doc: "== header.format_minor." }
+      - { off: 12,  name: trailer_flags,       type: u32,     flags: trailer_flags }
+      - { off: 16,  name: archive_uuid,        type: bytes16, doc: "== header.archive_uuid." }
+      - { off: 32,  name: archive_len,         type: u64,     doc: "Byte length of the complete archive file, trailer included." }
+      - { off: 40,  name: index_offset,        type: u64,     doc: "Offset in the complete archive of the INDX block header." }
+      - { off: 48,  name: index_len,           type: u64,     doc: "Payload length of the INDX block." }
+      - { off: 56,  name: prev_trailer_offset, type: u64,     doc: "Reserved for checkpoint trailers. MUST be 0 in 0.x." }
+      - { off: 64,  name: header_digest,       type: bytes32, doc: "BLAKE3 of the 32 header bytes." }
+      - { off: 96,  name: index_digest,        type: bytes32, doc: "BLAKE3 of the INDX payload." }
+      - { off: 128, name: trailer_digest,      type: bytes32, doc: "BLAKE3 of trailer bytes [0, 128)." }
+
+  - name: block_header
+    size: 56
+    doc: "Frames every block. Blocks tile [HEADER_LEN, index_offset + BLOCK_HEADER_LEN + index_len)."
+    fields:
+      - { off: 0,  name: type_id,        type: bytes4,  doc: "ASCII block type id." }
+      - { off: 4,  name: flags,          type: u32,     flags: block_flags }
+      - { off: 8,  name: payload_len,    type: u64,     doc: "Bytes of payload following this header." }
+      - { off: 16, name: payload_digest, type: bytes32, doc: "BLAKE3 of the payload bytes as stored." }
+      - { off: 48, name: header_check,   type: bytes8,  doc: "First 8 bytes of BLAKE3 of this header's bytes [0, 48). Error detection, not trust." }
+
+  - name: data_header
+    size: 56
+    doc: "Start of every DATA payload; the stored bytes follow (payload_len - DATA_HEADER_LEN of them)."
+    fields:
+      - { off: 0,  name: ino,         type: u64,     doc: "== ino of the inode whose extent references this block." }
+      - { off: 8,  name: file_offset, type: u64,     doc: "== that extent's file_offset." }
+      - { off: 16, name: raw_len,     type: u32,     doc: "== that extent's raw_len." }
+      - { off: 20, name: codec,       type: u16,     enum: codec }
+      - { off: 22, name: reserved0,   type: u16,     reserved: true }
+      - { off: 24, name: raw_digest,  type: bytes32, doc: "BLAKE3 of the raw bytes. == that extent's raw_digest." }
+
+  - name: index_header
+    size: 136
+    doc: "Start of the INDX payload. Tables follow in `index_tables` order."
+    heap_refs: [[writer_off, writer_len], [label_off, label_len]]
+    fields:
+      - { off: 0,   name: index_codec,       type: u16,     enum: index_codec }
+      - { off: 2,   name: source_fs,         type: u16,     enum: source_fs }
+      - { off: 4,   name: capabilities,      type: u32,     flags: capabilities }
+      - { off: 8,   name: capture_time_sec,  type: i64,     doc: "Snapshot time, seconds since 1970-01-01T00:00:00Z, signed." }
+      - { off: 16,  name: capture_time_nsec, type: u32,     doc: "< NSEC_LIMIT." }
+      - { off: 20,  name: chain_count,       type: u32 }
+      - { off: 24,  name: source_fs_uuid,    type: bytes16, doc: "Filesystem UUID of the captured source." }
+      - { off: 40,  name: root_ino,          type: u64,     doc: "ino of the root directory. Never assumed." }
+      - { off: 48,  name: base_ref,          type: u32,     doc: "1-based chain entry this capture was taken relative to; 0 = full capture." }
+      - { off: 52,  name: reserved0,         type: u32,     reserved: true }
+      - { off: 56,  name: inode_count,       type: u64 }
+      - { off: 64,  name: dir_count,         type: u64 }
+      - { off: 72,  name: dirent_count,      type: u64 }
+      - { off: 80,  name: extent_count,      type: u64 }
+      - { off: 88,  name: xattr_count,       type: u64 }
+      - { off: 96,  name: tombstone_count,   type: u64,     doc: "MUST be 0 in 0.x." }
+      - { off: 104, name: heap_len,          type: u64 }
+      - { off: 112, name: writer_off,        type: u64,     doc: "Heap ref: writer name and version. Non-empty." }
+      - { off: 120, name: writer_len,        type: u32 }
+      - { off: 124, name: label_len,         type: u32 }
+      - { off: 128, name: label_off,         type: u64,     doc: "Heap ref: free-text label. May be empty." }
+
+  - name: chain_record
+    size: 64
+    doc: "An ancestor archive this archive references."
+    fields:
+      - { off: 0,  name: archive_uuid,      type: bytes16 }
+      - { off: 16, name: index_digest,      type: bytes32, doc: "The ancestor's trailer.index_digest." }
+      - { off: 48, name: capture_time_sec,  type: i64 }
+      - { off: 56, name: capture_time_nsec, type: u32 }
+      - { off: 60, name: reserved0,         type: u32,     reserved: true }
+
+  - name: inode_record
+    size: 168
+    doc: "One inode alive in the snapshot. Sorted by ino, strictly ascending."
+    heap_refs: [[target_off, size]]
+    fields:
+      - { off: 0,   name: ino,           type: u64 }
+      - { off: 8,   name: mode,          type: u32,     doc: "Linux st_mode: file_type (mask 0xF000) | permission bits." }
+      - { off: 12,  name: generation,    type: u32,     doc: "Source i_generation." }
+      - { off: 16,  name: uid,           type: u32 }
+      - { off: 20,  name: gid,           type: u32 }
+      - { off: 24,  name: size,          type: u64,     doc: "reg: byte length. lnk: target length. Every other type: 0." }
+      - { off: 32,  name: atime_sec,     type: i64 }
+      - { off: 40,  name: mtime_sec,     type: i64 }
+      - { off: 48,  name: ctime_sec,     type: i64 }
+      - { off: 56,  name: crtime_sec,    type: i64,     doc: "0 unless present.crtime." }
+      - { off: 64,  name: atime_nsec,    type: u32 }
+      - { off: 68,  name: mtime_nsec,    type: u32 }
+      - { off: 72,  name: ctime_nsec,    type: u32 }
+      - { off: 76,  name: crtime_nsec,   type: u32 }
+      - { off: 80,  name: rdev_major,    type: u32,     doc: "0 unless chr/blk." }
+      - { off: 84,  name: rdev_minor,    type: u32,     doc: "0 unless chr/blk." }
+      - { off: 88,  name: fs_flags,      type: u32,     doc: "Source-specific (see source_fs). 0 unless capabilities.fs_flags." }
+      - { off: 92,  name: present,       type: u32,     flags: present }
+      - { off: 96,  name: content_kind,  type: u16,     enum: content_kind }
+      - { off: 98,  name: reserved0,     type: u16,     reserved: true }
+      - { off: 100, name: chain_ref,     type: u32,     doc: "1-based chain entry if inherited, else 0." }
+      - { off: 104, name: extent_first,  type: u64,     doc: "Tiling: index into the extent table." }
+      - { off: 112, name: extent_count,  type: u32,     doc: "0 unless content_kind = extents." }
+      - { off: 116, name: xattr_count,   type: u32 }
+      - { off: 120, name: xattr_first,   type: u64,     doc: "Tiling: index into the xattr table." }
+      - { off: 128, name: target_off,    type: u64,     doc: "Heap offset of the symlink target; 0 unless symlink." }
+      - { off: 136, name: content_digest, type: bytes32, doc: "BLAKE3 of the full logical content (holes as zeros) for extents/inherited; all-zero otherwise." }
+
+  - name: dir_record
+    size: 40
+    doc: "One per directory inode, sorted by ino."
+    fields:
+      - { off: 0,  name: ino,             type: u64 }
+      - { off: 8,  name: dirent_first,    type: u64, doc: "Tiling: index into the dirent table." }
+      - { off: 16, name: dirent_count,    type: u32 }
+      - { off: 20, name: completeness,    type: u16, enum: completeness }
+      - { off: 22, name: reserved0,       type: u16, reserved: true }
+      - { off: 24, name: tombstone_first, type: u64, doc: "MUST be 0 in 0.x." }
+      - { off: 32, name: tombstone_count, type: u32, doc: "MUST be 0 in 0.x." }
+      - { off: 36, name: reserved1,       type: u32, reserved: true }
+
+  - name: dirent_record
+    size: 24
+    doc: "One name in a directory. Parent is implied by the dir_record whose range contains it."
+    heap_refs: [[name_off, name_len]]
+    fields:
+      - { off: 0,  name: child_ino, type: u64 }
+      - { off: 8,  name: name_off,  type: u64 }
+      - { off: 16, name: name_len,  type: u32 }
+      - { off: 20, name: reserved0, type: u32, reserved: true }
+
+  - name: extent_record
+    size: 56
+    doc: "One chunk of a file. Owner is implied by the inode_record whose range contains it."
+    fields:
+      - { off: 0,  name: file_offset,     type: u64 }
+      - { off: 8,  name: block_offset,    type: u64,     doc: "Offset of the DATA block header." }
+      - { off: 16, name: raw_len,         type: u32,     doc: "1..=MAX_CHUNK_RAW." }
+      - { off: 20, name: offset_in_block, type: u32,     doc: "Reserved for PACK. MUST be 0." }
+      - { off: 24, name: raw_digest,      type: bytes32 }
+
+  - name: xattr_record
+    size: 24
+    doc: "One extended attribute. Owner is implied by the inode_record whose range contains it."
+    heap_refs: [[name_off, name_len], [value_off, value_len]]
+    fields:
+      - { off: 0,  name: name_off,  type: u64, doc: "Full name including namespace, e.g. user.foo." }
+      - { off: 8,  name: value_off, type: u64, doc: "Linux VFS (getxattr) representation." }
+      - { off: 16, name: name_len,  type: u32 }
+      - { off: 20, name: value_len, type: u32 }
+
+# Tables inside the INDX payload, in on-disk order, after index_header.
+# `tombstone` has no defined record; its count MUST be 0 in 0.x.
+index_tables:
+  - { name: chain,     record: chain_record,  count: chain_count }
+  - { name: inode,     record: inode_record,  count: inode_count }
+  - { name: dir,       record: dir_record,    count: dir_count }
+  - { name: dirent,    record: dirent_record, count: dirent_count }
+  - { name: extent,    record: extent_record, count: extent_count }
+  - { name: xattr,     record: xattr_record,  count: xattr_count }
+  - { name: tombstone, record: null,          count: tombstone_count }
+heap:
+  length_field: index_header.heap_len
+  offset_origin: "first byte of the heap"
+  follows: "the last table"
+
+# ---------------------------------------------------------------------------
+# Verification order. A reader performs these phases in order and reports the
+# FIRST violated rule. Within a phase, rules are checked in rules.yaml order.
+# ---------------------------------------------------------------------------
+phases:
+  - { name: envelope,  doc: "Size, header magic, version refusal, header flags." }
+  - { name: trailer,   doc: "Trailer magic, self digest, agreement with header, flags, header digest, reserved fields, classification, index geometry." }
+  - { name: index_seal, doc: "INDX block header, its agreement with the trailer, and BLAKE3 of the payload. Nothing in the payload is parsed before this passes." }
+  - { name: index_structure, doc: "Stage 1: index header enums/flags/reserved/ranges, table geometry, heap bounds, every record's enums/flags/reserved/ranges." }
+  - { name: index_semantics, doc: "Stage 2, only on stage-1-valid data: order, tiling, per-type rules, namespace." }
+  - { name: blocks,    doc: "Archives only (not sidecars): block tiling, unknown types, DATA agreement with extents, digests, decoding, file content digests." }
+  - { name: chain,     doc: "Only when ancestors are supplied: agreement of inherited inodes with the ancestor that stores them." }
+
+# Normative statements that are deliberately NOT rules, each with the reason.
+notes:
+  - text: "Digests provide integrity, not authenticity. No key is involved; anyone able to write the archive can re-seal it."
+    not_a_rule_because: "A statement about what the format does not claim; there is nothing a reader can check."

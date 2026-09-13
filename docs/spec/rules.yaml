@@ -1,3 +1,516 @@
 # Diavolo format rules, as data. Declared as an input by format.yaml.
 #
-# UNSTABLE until v0.1.0.
+# UNSTABLE until Diavolo v0.1.0.
+#
+# Every rule has:
+#   id        stable identifier; the decoder's error taxonomy is generated from these
+#   level     MUST | SHOULD
+#   phase     one of format.yaml `phases` (reader rules only)
+#   scope     file      a reader checks it on one file         -> needs >= 1 broken fixture
+#             chain     a reader checks it across archives      -> needs >= 1 broken fixture
+#             writer    a writer obligation no reader can see   -> no fixture, reason required
+#             behaviour a tool obligation, tested by tool tests -> no fixture, reason required
+#   text      the rule
+#   fixtures  names in corpus.yaml `broken`, each violating exactly this rule
+#
+# The generator fails on a file/chain rule with no fixture, on a fixture citing
+# an unknown rule, and on a fixture no rule cites.
+
+rules:
+  # ---- envelope ------------------------------------------------------------
+  - id: file.too_short
+    level: MUST
+    phase: envelope
+    scope: file
+    text: "Reject a file shorter than HEADER_LEN + BLOCK_HEADER_LEN + INDEX_HEADER_LEN + TRAILER_LEN."
+    fixtures: [file-too-short]
+  - id: header.magic
+    level: MUST
+    phase: envelope
+    scope: file
+    text: "Reject unless header.magic == HEADER_MAGIC."
+    fixtures: [header-magic]
+  - id: header.version_unsupported
+    level: MUST
+    phase: envelope
+    scope: file
+    text: "Reject unless (header.format_major, header.format_minor) is an accepted row of the acceptance table."
+    fixtures: [header-version-major, header-version-minor]
+  - id: header.flags_unknown_odd
+    level: MUST
+    phase: envelope
+    scope: file
+    text: "Reject if header.header_flags has an unknown bit set at an odd position. Unknown even bits are ignored."
+    fixtures: [header-flags-unknown-odd]
+
+  # ---- trailer -------------------------------------------------------------
+  - id: trailer.magic
+    level: MUST
+    phase: trailer
+    scope: file
+    text: "Reject unless the last TRAILER_LEN bytes begin with TRAILER_MAGIC."
+    fixtures: [trailer-magic]
+  - id: trailer.self_digest
+    level: MUST
+    phase: trailer
+    scope: file
+    text: "Reject unless trailer.trailer_digest == BLAKE3(trailer bytes [0, 128))."
+    fixtures: [trailer-self-digest]
+  - id: trailer.version_mismatch
+    level: MUST
+    phase: trailer
+    scope: file
+    text: "Reject unless trailer.format_major == header.format_major and trailer.format_minor == header.format_minor."
+    fixtures: [trailer-version-mismatch]
+  - id: trailer.uuid_mismatch
+    level: MUST
+    phase: trailer
+    scope: file
+    text: "Reject unless trailer.archive_uuid == header.archive_uuid."
+    fixtures: [trailer-uuid-mismatch]
+  - id: trailer.flags_unknown_odd
+    level: MUST
+    phase: trailer
+    scope: file
+    text: "Reject if trailer.trailer_flags has an unknown bit set at an odd position."
+    fixtures: [trailer-flags-unknown-odd]
+  - id: trailer.header_digest
+    level: MUST
+    phase: trailer
+    scope: file
+    text: "Reject unless trailer.header_digest == BLAKE3(header bytes [0, HEADER_LEN))."
+    fixtures: [trailer-header-digest]
+  - id: trailer.prev_offset_nonzero
+    level: MUST
+    phase: trailer
+    scope: file
+    text: "Reject unless trailer.prev_trailer_offset == 0."
+    fixtures: [trailer-prev-offset]
+  - id: trailer.index_geometry
+    level: MUST
+    phase: trailer
+    scope: file
+    text: "Reject unless index_offset >= HEADER_LEN and index_offset + BLOCK_HEADER_LEN + index_len + TRAILER_LEN == archive_len, computed without overflow."
+    fixtures: [trailer-index-geometry]
+  - id: file.size_unclassifiable
+    level: MUST
+    phase: trailer
+    scope: file
+    text: "The file is an archive if its size == archive_len, else a sidecar if its size == HEADER_LEN + BLOCK_HEADER_LEN + index_len + TRAILER_LEN (INDX block at HEADER_LEN); reject if neither. When both hold it is an archive."
+    fixtures: [file-truncated]
+
+  # ---- index_seal ----------------------------------------------------------
+  - id: block.header_check
+    level: MUST
+    phase: index_seal
+    scope: file
+    text: "Reject a block whose header_check != first 8 bytes of BLAKE3(block header bytes [0, 48))."
+    fixtures: [index-block-header-check, data-block-header-check]
+  - id: index.block_type
+    level: MUST
+    phase: index_seal
+    scope: file
+    text: "Reject unless the block at the index position has type_id INDX."
+    fixtures: [index-block-type]
+  - id: block.flags_unknown_odd
+    level: MUST
+    phase: index_seal
+    scope: file
+    text: "Reject a block whose flags have an unknown bit set at an odd position."
+    fixtures: [index-block-flags-unknown-odd]
+  - id: block.skip_on_known
+    level: MUST
+    phase: index_seal
+    scope: file
+    text: "Reject a DATA or INDX block with flags.skip set."
+    fixtures: [index-block-skip, data-block-skip]
+  - id: index.len_mismatch
+    level: MUST
+    phase: index_seal
+    scope: file
+    text: "Reject unless the INDX block's payload_len == trailer.index_len."
+    fixtures: [index-len-mismatch]
+  - id: index.block_digest_mismatch
+    level: MUST
+    phase: index_seal
+    scope: file
+    text: "Reject unless the INDX block's payload_digest == trailer.index_digest."
+    fixtures: [index-block-digest-mismatch]
+  - id: index.digest
+    level: MUST
+    phase: index_seal
+    scope: file
+    text: "Reject unless BLAKE3(INDX payload) == trailer.index_digest. No payload byte is interpreted before this passes."
+    fixtures: [index-digest]
+
+  # ---- index_structure (stage 1) -------------------------------------------
+  - id: index.too_short
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject an INDX payload shorter than INDEX_HEADER_LEN."
+    fixtures: [index-too-short]
+  - id: index.codec
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject unless index_header.index_codec is a defined non-invalid index_codec value."
+    fixtures: [index-codec-invalid, index-codec-unknown]
+  - id: index.source_fs
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject unless index_header.source_fs is a defined non-invalid source_fs value."
+    fixtures: [index-source-fs]
+  - id: index.capabilities_unknown_odd
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject if index_header.capabilities has an unknown bit set at an odd position."
+    fixtures: [index-capabilities-unknown-odd]
+  - id: record.reserved_nonzero
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject if any field marked reserved in any layout is nonzero."
+    fixtures: [index-reserved-nonzero, inode-reserved-nonzero, data-reserved-nonzero]
+  - id: time.nsec_range
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject if any *_nsec field is >= NSEC_LIMIT."
+    fixtures: [index-capture-nsec, inode-mtime-nsec]
+  - id: index.geometry
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject unless INDX payload_len == INDEX_HEADER_LEN + sum(count * record size) + heap_len over the defined tables, computed without overflow."
+    fixtures: [index-geometry]
+  - id: index.tombstones_nonzero
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject unless index_header.tombstone_count == 0, and every dir_record's tombstone_first and tombstone_count == 0."
+    fixtures: [index-tombstone-count, dir-tombstone-count]
+  - id: heap.bounds
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject if any heap reference has offset + len > heap_len, computed without overflow."
+    fixtures: [heap-bounds-dirent, heap-bounds-symlink]
+  - id: heap.empty_offset
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject a zero-length heap reference whose offset is not 0."
+    fixtures: [heap-empty-offset]
+  - id: index.writer_empty
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject if the writer heap reference is empty."
+    fixtures: [index-writer-empty]
+  - id: inode.present_unknown_odd
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject if an inode's present flags have an unknown bit set at an odd position."
+    fixtures: [inode-present-unknown-odd]
+  - id: inode.content_kind
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject unless every inode's content_kind is a defined non-invalid value."
+    fixtures: [inode-content-kind-invalid, inode-content-kind-unknown]
+  - id: inode.file_type
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject unless every inode's mode & 0xF000 is a defined non-invalid file_type."
+    fixtures: [inode-file-type]
+  - id: dir.completeness
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject unless every dir_record's completeness is complete. invalid, partial (registered, undefined) and unlisted values are all rejected."
+    fixtures: [dir-completeness-invalid, dir-completeness-partial]
+  - id: extent.raw_len_range
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject an extent whose raw_len is 0 or > MAX_CHUNK_RAW."
+    fixtures: [extent-raw-len-zero, extent-raw-len-large]
+  - id: extent.offset_in_block_nonzero
+    level: MUST
+    phase: index_structure
+    scope: file
+    text: "Reject an extent whose offset_in_block != 0."
+    fixtures: [extent-offset-in-block]
+
+  # ---- index_semantics (stage 2) -------------------------------------------
+  - id: index.base_ref
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless base_ref <= chain_count, and base_ref == 0 implies chain_count == 0."
+    fixtures: [index-base-ref-range, index-base-ref-zero-with-chain]
+  - id: chain.self_or_duplicate
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject a chain entry whose archive_uuid equals this archive's, or equals another entry's."
+    fixtures: [chain-self, chain-duplicate]
+  - id: inode.order
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless every inode's ino != 0 and inodes are strictly ascending by ino."
+    fixtures: [inode-order, inode-ino-zero]
+  - id: inode.content_kind_for_type
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject an inode whose content_kind is not admitted for its file_type by content_kind_by_type."
+    fixtures: [inode-kind-for-type]
+  - id: inode.size_for_type
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless size == 0 for every type other than reg and lnk, and 1 <= size <= SYMLINK_MAX for lnk."
+    fixtures: [inode-dir-size, inode-symlink-size]
+  - id: inode.fields_for_kind
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless: extent_count == 0 unless extents; chain_ref != 0 iff inherited; target_off == 0 unless symlink; rdev_major == rdev_minor == 0 unless chr or blk; content_digest all-zero unless extents or inherited."
+    fixtures: [inode-extents-on-none, inode-chain-ref-missing, inode-rdev-on-reg, inode-digest-on-dir]
+  - id: inode.chain_ref_range
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject an inherited inode whose chain_ref > chain_count."
+    fixtures: [inode-chain-ref-range]
+  - id: inode.absent_nonzero
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject if present.nsec is clear and any *_nsec is nonzero, or present.crtime is clear and crtime_sec or crtime_nsec is nonzero."
+    fixtures: [inode-nsec-absent-nonzero, inode-crtime-absent-nonzero]
+  - id: inode.capability_absent_nonzero
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject if capabilities.xattrs is clear and any inode has xattr_count > 0, or capabilities.fs_flags is clear and any fs_flags != 0, or capabilities.crtime is clear and any present.crtime is set."
+    fixtures: [inode-xattrs-without-capability]
+  - id: inode.extent_tiling
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless inode ranges [extent_first, extent_first + extent_count) tile the extent table in inode order: the first is 0, each begins where the previous ended, the last ends at extent_count."
+    fixtures: [inode-extent-tiling]
+  - id: inode.xattr_tiling
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless inode ranges [xattr_first, xattr_first + xattr_count) tile the xattr table in inode order."
+    fixtures: [inode-xattr-tiling]
+  - id: extent.order
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless each inode's extents are strictly ascending and non-overlapping: file_offset[i] + raw_len[i] <= file_offset[i+1]."
+    fixtures: [extent-overlap]
+  - id: extent.beyond_size
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject an extent with file_offset + raw_len > the owning inode's size, computed without overflow."
+    fixtures: [extent-beyond-size]
+  - id: xattr.name
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject an xattr whose name is empty, contains NUL, or exceeds XATTR_NAME_MAX, or whose value exceeds XATTR_VALUE_MAX."
+    fixtures: [xattr-name-empty]
+  - id: xattr.order
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless each inode's xattrs are strictly ascending by name bytes (so unique)."
+    fixtures: [xattr-order]
+  - id: dir.bijection
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless dir_records and dir inodes correspond one to one, in the same ino order."
+    fixtures: [dir-missing-record, dir-record-for-reg]
+  - id: dir.dirent_tiling
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless dir ranges [dirent_first, dirent_first + dirent_count) tile the dirent table in dir order."
+    fixtures: [dir-dirent-tiling]
+  - id: dirent.name
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject a dirent name that is empty, longer than NAME_MAX, contains '/' or NUL, or is '.' or '..'."
+    fixtures: [dirent-name-slash, dirent-name-dotdot]
+  - id: dirent.order
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless each directory's dirents are strictly ascending by name bytes (so unique)."
+    fixtures: [dirent-order]
+  - id: dirent.child_missing
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject a dirent whose child_ino is not in the inode table."
+    fixtures: [dirent-child-missing]
+  - id: namespace.root
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless root_ino is in the inode table, is a dir, and is named by no dirent."
+    fixtures: [namespace-root-not-dir, namespace-root-named]
+  - id: namespace.dir_links
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless every directory other than the root is named by exactly one dirent."
+    fixtures: [namespace-dir-hardlink]
+  - id: namespace.orphan
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject a non-directory inode named by no dirent."
+    fixtures: [namespace-orphan]
+  - id: namespace.unreachable
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject unless every directory is reachable from the root."
+    fixtures: [namespace-cycle]
+  - id: index.inherited_in_full
+    level: MUST
+    phase: index_semantics
+    scope: file
+    text: "Reject an inherited inode in a full capture (base_ref == 0)."
+    fixtures: [index-inherited-in-full]
+
+  # ---- blocks (archives only) ----------------------------------------------
+  - id: blocks.tiling
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject unless blocks, each BLOCK_HEADER_LEN + payload_len long, tile [HEADER_LEN, index_offset) exactly."
+    fixtures: [blocks-tiling]
+  - id: blocks.stray_index
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject an INDX block anywhere other than index_offset."
+    fixtures: [blocks-stray-index]
+  - id: blocks.unknown_type
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject a block of unknown or registered-undefined type_id without flags.skip. Such a block with flags.skip is ignored."
+    fixtures: [blocks-unknown-no-skip, blocks-registered-no-skip]
+  - id: extent.block_offset
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject an extent whose block_offset is not the start of a DATA block in the tiling."
+    fixtures: [extent-block-offset]
+  - id: blocks.data_references
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject unless every DATA block is referenced by exactly one extent."
+    fixtures: [blocks-data-unreferenced, blocks-data-shared]
+  - id: data.payload_digest
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject a block whose payload_digest != BLAKE3(payload)."
+    fixtures: [data-payload-digest]
+  - id: data.too_short
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject a DATA payload shorter than DATA_HEADER_LEN."
+    fixtures: [data-too-short]
+  - id: data.codec
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject a DATA block whose codec is not a defined non-invalid value."
+    fixtures: [data-codec]
+  - id: data.matches_extent
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject unless data_header.ino == owning inode's ino, file_offset == extent.file_offset, raw_len == extent.raw_len, raw_digest == extent.raw_digest."
+    fixtures: [data-ino, data-file-offset, data-raw-len, data-raw-digest-field]
+  - id: data.stored_len
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject a stored-codec DATA block whose stored byte count != raw_len."
+    fixtures: [data-stored-len]
+  - id: data.decode
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject a zstd DATA block whose stored bytes are not exactly one valid zstd frame decoding to exactly raw_len bytes."
+    fixtures: [data-zstd-bad-frame, data-zstd-short]
+  - id: data.raw_digest
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject a DATA block where BLAKE3(decoded raw bytes) != raw_digest."
+    fixtures: [data-raw-digest]
+  - id: inode.content_digest
+    level: MUST
+    phase: blocks
+    scope: file
+    text: "Reject an extents inode whose content_digest != BLAKE3 of its logical content: size bytes, extent bytes at their offsets, zeros elsewhere."
+    fixtures: [inode-content-digest]
+
+  # ---- chain ---------------------------------------------------------------
+  - id: chain.ancestor_digest
+    level: MUST
+    phase: chain
+    scope: chain
+    text: "Reject if a supplied archive with a chain entry's archive_uuid has trailer.index_digest != that entry's index_digest."
+    fixtures: [chain-ancestor-digest]
+  - id: chain.inherited_match
+    level: MUST
+    phase: chain
+    scope: chain
+    text: "Reject an inherited inode unless the referenced ancestor has an inode with the same ino, generation, size and content_digest, whose content_kind is extents."
+    fixtures: [chain-inherited-digest, chain-inherited-not-stored]
+
+  # ---- writer / behaviour ----------------------------------------------------
+  - id: writer.registered_types
+    level: MUST
+    scope: writer
+    text: "A writer MUST NOT write a registered-undefined block type or enum value."
+    no_fixture_because: "A reader treats these exactly as unknown values, which rules blocks.unknown_type and dir.completeness already cover."
+  - id: writer.heap_minimal
+    level: SHOULD
+    scope: writer
+    text: "A writer SHOULD NOT emit heap bytes no reference addresses."
+    no_fixture_because: "Unreferenced heap bytes are valid; a reader cannot reject them."
+  - id: policy.unverified_content
+    level: MUST
+    scope: behaviour
+    text: "No tool emits bytes of a DATA block that failed data.payload_digest, data.decode or data.raw_digest. FUSE read returns EIO; restore does not create the file, continues with other files, and exits non-zero naming each failure."
+    no_fixture_because: "Tool behaviour over a file the corpus already contains (data-raw-digest); tested by diavolo-fuse and diavolo-cli tests."
+  - id: policy.sidecar_content
+    level: MUST
+    scope: behaviour
+    text: "A content read through a sidecar fails with a distinct 'content not present' error, never a digest error."
+    no_fixture_because: "Tool behaviour over golden sidecars; tested by diavolo-format and diavolo-fuse tests."

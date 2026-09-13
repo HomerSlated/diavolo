@@ -100,7 +100,8 @@ Consequences:
     per archive, from the record sizes in D5 plus names. ***Inference***: not yet
     measured.
   - dump's `.daf` for the L0 is on the same order.
-  - Against a 30 GiB incremental, this is noise.
+  - This is noise against a full, but not against a quiet incremental; see D5 and
+    open question 2.
 
 **The trap stays shut in writing.** Every directory record carries `completeness`:
 

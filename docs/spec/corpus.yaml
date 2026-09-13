@@ -1,0 +1,4 @@
+# Diavolo conformance corpus: fixture descriptions. Declared as an input by
+# format.yaml. Assembled by xtask per docs/design/0002. UNSTABLE until v0.1.0.
+goldens: []
+broken: []
