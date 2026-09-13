@@ -68,3 +68,54 @@ Those are owned elsewhere, so they are recorded here and reported to kgr, not ed
 - **Mode 3:** *not* answered by the format. What a restore does with a non-empty
   target is tool behaviour. The spec was silent on it, and brief PART 7 rule 4 says
   silence is the failure mode. It is now rule `policy.restore_target`.
+
+## Addendum — what says removal is intended, and the actual mechanism
+
+Checked against kgr's 0.4b56 clone (`private/code/dump-code`, HEAD `9e6f839`).
+
+**Intent, from strongest to weakest source:**
+
+1. **`restore/restore.c` above `removeoldleaves()`.** This is inherited from 4.4BSD
+   and is © 1983, 1993 The Regents of the University of California:
+
+   > The following four routines implement the incremental restore algorithm. The
+   > first removes old entries, the second does renames and calculates the
+   > extraction list, the third cleans up link names missed by the first two, and
+   > the final one deletes old directories.
+
+2. **`restore/tape.c:374-375`.** The record dump writes first is called by restore's
+   own error message the *file removal list*:
+   `if (spcl.c_type != TS_CLRI) errx(1, "Cannot find file removal list");`
+3. **Upstream bug #157** (<https://sourceforge.net/p/dump/bugs/157/>), fixed by
+   `fe2d1f1`, Ben Harris, 2014, "restore: fix hang when dir is removed". A regression
+   in removing deleted directories during incremental restore was treated as a bug
+   and fixed. Removal is intended behaviour.
+4. **Dave Martindale, comp.unix.wizards, 2 May 1986**
+   (<https://www.tuhs.org/Usenet/comp.unix.wizards/1986-May/004579.html>):
+
+   > When you restore an incremental dump over a lower-level dump, it has to delete
+   > files that have been removed and relink things that have changed names.
+
+   This is contemporary practitioner testimony, not documentation.
+
+**Not a source:** `restore(8)`. The FreeBSD, NetBSD, OpenBSD and Linux pages say only
+that incrementals are "layered on top" and that `restoresymtable` passes information
+between passes. None of them states that deleted files are removed.
+
+**The mechanism.** It corrects SOLUTIONS.md and brief PART 8.1, which attribute
+removal to diffing directory entry lists.
+
+- **Every dump carries the complete used-inode map, regardless of level.**
+  - `dump/main.c:909` writes `dumpmap(usedinomap, TS_CLRI, …)`.
+  - `removeoldleaves()` (`restore.c:208-226`) marks REMOVE every inode that is in the
+    symbol table but absent from that map.
+  - Dumped directory listings then handle names: renames and new links in
+    `nodeupdates()`, and dropped links to still-live inodes in `findunreflinks()`,
+    such as the hardlink case in run A.
+- **Completeness is therefore per dump for inode existence, and chain-carried for
+  names.** The design lesson in 0001 D3 stands, and is if anything reinforced: dump's
+  only complete positive record is an inode *bitmap* in every file.
+- **The `nodump` trap, located exactly.** `dump/traverse.c:299` and `:616-619` clear
+  excluded inodes from `usedinomap`. An excluded file therefore reaches restore
+  looking exactly like a deleted one. This is brief PART 4 gap 13, and the reason
+  0001 D4 makes exclusion a positive record.
