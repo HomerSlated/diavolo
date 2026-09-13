@@ -2,3 +2,4 @@
 # Generated sources and docs are COMMITTED on purpose: CI regenerates them and
 # fails on any diff. Do not add crates/*/src/generated/, docs/generated/ or
 # corpus/ here.
+/private/

@@ -183,7 +183,7 @@ layouts:
 
   - name: block_header
     size: 56
-    doc: "Frames every block. Blocks tile [HEADER_LEN, index_offset + BLOCK_HEADER_LEN + index_len)."
+    doc: "Frames every block. Non-index blocks tile [HEADER_LEN, index_offset) (rule blocks.tiling); the INDX block follows at index_offset."
     fields:
       - { off: 0,  name: type_id,        type: bytes4,  doc: "ASCII block type id." }
       - { off: 4,  name: flags,          type: u32,     flags: block_flags }

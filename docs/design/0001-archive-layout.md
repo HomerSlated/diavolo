@@ -247,8 +247,10 @@ The index's extent record repeats `raw_len` and `raw_digest`, and adds `block_of
     only from `Raw_Block` and `RLE_Block` blocks, assembled by hand from RFC 8878.
     They are deterministic by construction and still genuine zstd frames that any
     decoder must accept. That keeps the CI diff gate over `corpus/` total.
-  - A fixture with a real `Compressed_Block` may be added later, as committed bytes
-    that the generator copies and never regenerates.
+  - A fixture with a real `Compressed_Block` may be added later. Its frame bytes are
+    then a **declared spec input** under `docs/spec/`, which the generator copies
+    into the corpus. They must not live under `corpus/`: the generator owns that
+    directory outright and deletes anything it did not produce.
 - **Packing many small files into one block** is a later block type. The extent
   record's `offset_in_block` field (MUST be 0 for DATA) exists so that it needs no
   layout change.

@@ -29,7 +29,7 @@ Trailer magic, self digest, agreement with header, flags, header digest, reserve
 | `trailer.header_digest` | MUST | Reject unless trailer.header_digest == BLAKE3(header bytes [0, HEADER_LEN)). | `trailer-header-digest` |
 | `trailer.prev_offset_nonzero` | MUST | Reject unless trailer.prev_trailer_offset == 0. | `trailer-prev-offset` |
 | `trailer.index_geometry` | MUST | Reject unless index_offset >= HEADER_LEN and index_offset + BLOCK_HEADER_LEN + index_len + TRAILER_LEN == archive_len, computed without overflow. | `trailer-index-geometry` |
-| `file.size_unclassifiable` | MUST | The file is an archive if its size == archive_len, else a sidecar if its size == HEADER_LEN + BLOCK_HEADER_LEN + index_len + TRAILER_LEN (INDX block at HEADER_LEN); reject if neither. When both hold it is an archive. | `file-truncated` |
+| `file.size_unclassifiable` | MUST | The file is an archive if its size == archive_len, else a sidecar if its size == HEADER_LEN + BLOCK_HEADER_LEN + index_len + TRAILER_LEN (INDX block at HEADER_LEN); reject if neither. When both hold it is an archive. | `file-size-mismatch` |
 
 ## Phase `index_seal`
 
@@ -38,12 +38,12 @@ INDX block header, its agreement with the trailer, and BLAKE3 of the payload. No
 | id | level | rule | fixtures |
 |---|---|---|---|
 | `block.header_check` | MUST | Reject a block whose header_check != first 8 bytes of BLAKE3(block header bytes [0, 48)). | `index-block-header-check`, `data-block-header-check` |
-| `index.block_type` | MUST | Reject unless the block at the index position has type_id INDX. | `index-block-type` |
+| `index.block_type` | MUST | Reject unless the block at the index position has type_id INDX. The index position is trailer.index_offset for an archive and HEADER_LEN for a sidecar, as classified by file.size_unclassifiable; every index_seal rule reads the block at that position. | `index-block-type` |
 | `block.flags_unknown_odd` | MUST | Reject a block whose flags have an unknown bit set at an odd position. | `index-block-flags-unknown-odd` |
 | `block.skip_on_known` | MUST | Reject a DATA or INDX block with flags.skip set. | `index-block-skip`, `data-block-skip` |
-| `index.len_mismatch` | MUST | Reject unless the INDX block's payload_len == trailer.index_len. | `index-len-mismatch` |
-| `index.block_digest_mismatch` | MUST | Reject unless the INDX block's payload_digest == trailer.index_digest. | `index-block-digest-mismatch` |
-| `index.digest` | MUST | Reject unless BLAKE3(INDX payload) == trailer.index_digest. No payload byte is interpreted before this passes. | `index-digest` |
+| `index.len_mismatch` | MUST | Reject unless the payload_len of the block at the index position == trailer.index_len. | `index-len-mismatch` |
+| `index.block_digest_mismatch` | MUST | Reject unless the payload_digest of the block at the index position == trailer.index_digest. | `index-block-digest-mismatch` |
+| `index.digest` | MUST | Reject unless BLAKE3 of the payload of the block at the index position == trailer.index_digest. No payload byte is interpreted before this passes. | `index-digest` |
 
 ## Phase `index_structure`
 

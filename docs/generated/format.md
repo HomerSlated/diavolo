@@ -186,7 +186,7 @@ The last 160 bytes of the file. The root of trust.
 
 ### `block_header` — 56 bytes
 
-Frames every block. Blocks tile [HEADER_LEN, index_offset + BLOCK_HEADER_LEN + index_len).
+Frames every block. Non-index blocks tile [HEADER_LEN, index_offset) (rule blocks.tiling); the INDX block follows at index_offset.
 
 | offset | size | field | type | constraint | meaning |
 |---|---|---|---|---|---|
