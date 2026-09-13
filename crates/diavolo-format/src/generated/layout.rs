@@ -261,7 +261,7 @@ pub mod trailer {
     pub const FIELDS: &[(&str, usize, usize)] = &[("magic", 0, 8), ("format_major", 8, 2), ("format_minor", 10, 2), ("trailer_flags", 12, 4), ("archive_uuid", 16, 16), ("archive_len", 32, 8), ("index_offset", 40, 8), ("index_len", 48, 8), ("prev_trailer_offset", 56, 8), ("header_digest", 64, 32), ("index_digest", 96, 32), ("trailer_digest", 128, 32)];
 }
 
-/// Frames every block. Blocks tile [HEADER_LEN, index_offset + BLOCK_HEADER_LEN + index_len).
+/// Frames every block. Non-index blocks tile [HEADER_LEN, index_offset) (rule blocks.tiling); the INDX block follows at index_offset.
 pub mod block_header {
     use super::*;
 

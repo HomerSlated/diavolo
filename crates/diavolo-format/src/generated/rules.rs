@@ -46,17 +46,17 @@ pub enum Rule {
     FileSizeUnclassifiable,
     /// `block.header_check`: Reject a block whose header_check != first 8 bytes of BLAKE3(block header bytes [0, 48)).
     BlockHeaderCheck,
-    /// `index.block_type`: Reject unless the block at the index position has type_id INDX.
+    /// `index.block_type`: Reject unless the block at the index position has type_id INDX. The index position is trailer.index_offset for an archive and HEADER_LEN for a sidecar, as classified by file.size_unclassifiable; every index_seal rule reads the block at that position.
     IndexBlockType,
     /// `block.flags_unknown_odd`: Reject a block whose flags have an unknown bit set at an odd position.
     BlockFlagsUnknownOdd,
     /// `block.skip_on_known`: Reject a DATA or INDX block with flags.skip set.
     BlockSkipOnKnown,
-    /// `index.len_mismatch`: Reject unless the INDX block's payload_len == trailer.index_len.
+    /// `index.len_mismatch`: Reject unless the payload_len of the block at the index position == trailer.index_len.
     IndexLenMismatch,
-    /// `index.block_digest_mismatch`: Reject unless the INDX block's payload_digest == trailer.index_digest.
+    /// `index.block_digest_mismatch`: Reject unless the payload_digest of the block at the index position == trailer.index_digest.
     IndexBlockDigestMismatch,
-    /// `index.digest`: Reject unless BLAKE3(INDX payload) == trailer.index_digest. No payload byte is interpreted before this passes.
+    /// `index.digest`: Reject unless BLAKE3 of the payload of the block at the index position == trailer.index_digest. No payload byte is interpreted before this passes.
     IndexDigest,
     /// `index.too_short`: Reject an INDX payload shorter than INDEX_HEADER_LEN.
     IndexTooShort,
@@ -628,12 +628,12 @@ impl Rule {
             Rule::TrailerIndexGeometry => "Reject unless index_offset >= HEADER_LEN and index_offset + BLOCK_HEADER_LEN + index_len + TRAILER_LEN == archive_len, computed without overflow.",
             Rule::FileSizeUnclassifiable => "The file is an archive if its size == archive_len, else a sidecar if its size == HEADER_LEN + BLOCK_HEADER_LEN + index_len + TRAILER_LEN (INDX block at HEADER_LEN); reject if neither. When both hold it is an archive.",
             Rule::BlockHeaderCheck => "Reject a block whose header_check != first 8 bytes of BLAKE3(block header bytes [0, 48)).",
-            Rule::IndexBlockType => "Reject unless the block at the index position has type_id INDX.",
+            Rule::IndexBlockType => "Reject unless the block at the index position has type_id INDX. The index position is trailer.index_offset for an archive and HEADER_LEN for a sidecar, as classified by file.size_unclassifiable; every index_seal rule reads the block at that position.",
             Rule::BlockFlagsUnknownOdd => "Reject a block whose flags have an unknown bit set at an odd position.",
             Rule::BlockSkipOnKnown => "Reject a DATA or INDX block with flags.skip set.",
-            Rule::IndexLenMismatch => "Reject unless the INDX block's payload_len == trailer.index_len.",
-            Rule::IndexBlockDigestMismatch => "Reject unless the INDX block's payload_digest == trailer.index_digest.",
-            Rule::IndexDigest => "Reject unless BLAKE3(INDX payload) == trailer.index_digest. No payload byte is interpreted before this passes.",
+            Rule::IndexLenMismatch => "Reject unless the payload_len of the block at the index position == trailer.index_len.",
+            Rule::IndexBlockDigestMismatch => "Reject unless the payload_digest of the block at the index position == trailer.index_digest.",
+            Rule::IndexDigest => "Reject unless BLAKE3 of the payload of the block at the index position == trailer.index_digest. No payload byte is interpreted before this passes.",
             Rule::IndexTooShort => "Reject an INDX payload shorter than INDEX_HEADER_LEN.",
             Rule::IndexCodec => "Reject unless index_header.index_codec is a defined non-invalid index_codec value.",
             Rule::IndexSourceFs => "Reject unless index_header.source_fs is a defined non-invalid source_fs value.",
@@ -712,7 +712,7 @@ impl Rule {
             Rule::TrailerHeaderDigest => &["trailer-header-digest"],
             Rule::TrailerPrevOffsetNonzero => &["trailer-prev-offset"],
             Rule::TrailerIndexGeometry => &["trailer-index-geometry"],
-            Rule::FileSizeUnclassifiable => &["file-truncated"],
+            Rule::FileSizeUnclassifiable => &["file-size-mismatch"],
             Rule::BlockHeaderCheck => &["index-block-header-check", "data-block-header-check"],
             Rule::IndexBlockType => &["index-block-type"],
             Rule::BlockFlagsUnknownOdd => &["index-block-flags-unknown-odd"],
