@@ -119,3 +119,46 @@ removal to diffing directory entry lists.
   excluded inodes from `usedinomap`. An excluded file therefore reaches restore
   looking exactly like a deleted one. This is brief PART 4 gap 13, and the reason
   0001 D4 makes exclusion a positive record.
+
+## Addendum 2 — two confounds in run A, found by tracing
+
+Prompted by kgr ("prove it"). The L1 pass was re-run under `strace`, recording
+`unlink`, `rmdir` and `rename`, on the same L0/L1 dumps.
+
+**Confound 1: L1 was not a genuine incremental.** L0 and L1 were both dated
+`17:31:54`, and dump dates have one-second resolution. L1 therefore re-dumped every
+live file: `restore -tf L1.dump` lists `keep/survivor`, `link-a` and `with-xattr`,
+none of which had changed. restore duly unlinked and re-extracted them.
+
+**Confound 2: an inode number was reused.** `rm plain-deleted` freed inode 14, and
+the recreated `replaced` was then allocated inode 14. restore identifies files by
+inode number, so it *renamed* `plain-deleted` to `replaced`
+(`rename("./plain-deleted", "./replaced")`) instead of deleting it. The "deleted plain
+file removed" check was never a deletion test.
+
+**What the trace does show cleanly.** restore itself removed the three deleted paths
+that were not confounded:
+
+- `unlink("./goesaway/child")`;
+- `rename("./goesaway", "./RSTTMP02049")`, then `rmdir("./RSTTMP02049")`;
+- `unlink("./link-b")`.
+
+Nothing recreated them. The `-x` control made no removal calls, and every deleted
+path remained.
+
+**What 0003's run A claimed, versus what survives.**
+
+- **Stands:** deletions of whole directories and of hardlinks are removed by the
+  `-r` pass.
+- **Unsupported until re-run:**
+  - a plain-file deletion on its own;
+  - survivors left untouched by an incremental pass.
+
+`tools/dump-deletion-proof.sh` removes both confounds:
+
+- it waits 2 s between population, L0, the mutations and L1;
+- it allocates the new inode before any inode is freed;
+- it aborts unless L1 omits the unchanged files.
+
+It prints the full trace, and it checks that unchanged files keep their inode
+numbers.
