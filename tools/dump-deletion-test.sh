@@ -63,6 +63,12 @@ $DUMP -1u -D "$W/dumpdates" -f "$W/L1.dump" "$W/src"
 # ---- restore the chain exactly as a bare-metal restore would --------------
 cd "$W/dst"
 $RESTORE -rf "$W/L0.dump"
+# Without this, every "absent" check below passes vacuously if L0 never created
+# the file. (lost+found already exists on a fresh ext4 target; restore says so.)
+for p in plain-deleted goesaway/child link-b; do
+	[ -e "$W/dst/$p" ] || { echo "FAIL  L0 restore did not create $p; later checks would be vacuous"; exit 1; }
+done
+[ "$(cat "$W/dst/replaced")" = original ] || { echo "FAIL  L0 restore: replaced != original"; exit 1; }
 $RESTORE -rf "$W/L1.dump"
 rm -f restoresymtable
 
@@ -99,6 +105,23 @@ else echo "FAIL  POSIX ACL lost"; fail=1; fi
 echo
 echo "--- full tree as restored ---"
 find "$W/dst" -mindepth 1 -not -path "*/lost+found*" | sed "s|^$W/dst|.|" | sort
+
+# ---- the three failure modes (brief PART 4 gap 3), as negative controls ----
+# Plain directories on $W's filesystem; restore needs no mount for these.
+echo
+echo "---- failure modes ----"
+mode() { rm -rf "$W/$1"; mkdir "$W/$1"; cd "$W/$1"; }
+mode m1; $RESTORE -rf "$W/L0.dump" >/dev/null 2>&1
+printf '1\nn\n' | timeout 60 $RESTORE -xf "$W/L1.dump" >/dev/null 2>&1 || true
+[ -e plain-deleted ] && echo "seen  mode 1 (-r L0, -x L1): deleted file silently kept" \
+                     || { echo "FAIL  mode 1 did not reproduce"; fail=1; }
+mode m2; $RESTORE -rf "$W/L0.dump" >/dev/null 2>&1; rm -f restoresymtable
+if $RESTORE -rf "$W/L1.dump" >/dev/null 2>&1; then echo "FAIL  mode 2: -r without restoresymtable succeeded"; fail=1
+else echo "seen  mode 2 (symtable removed): -r L1 REFUSES (loud, rc != 0)"; fi
+mode m3; echo junk > stray; $RESTORE -rf "$W/L0.dump" >/dev/null 2>&1; $RESTORE -rf "$W/L1.dump" >/dev/null 2>&1
+[ -e stray ] && echo "seen  mode 3 (non-pristine target): stray file silently kept" \
+             || { echo "FAIL  mode 3 did not reproduce"; fail=1; }
+cd "$W"
 
 echo
 [ $fail -eq 0 ] && echo "VERDICT: restore -r DOES replay deletions, and xattrs/ACLs survive." \

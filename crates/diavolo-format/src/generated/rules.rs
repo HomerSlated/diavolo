@@ -178,6 +178,8 @@ pub enum Rule {
     WriterHeapMinimal,
     /// `policy.unverified_content`: No tool emits bytes of a DATA block that failed data.payload_digest, data.decode or data.raw_digest. FUSE read returns EIO; restore does not create the file, continues with other files, and exits non-zero naming each failure.
     PolicyUnverifiedContent,
+    /// `policy.restore_target`: A full restore MUST refuse a target directory containing any entry other than an empty lost+found, unless explicitly told to reconcile; reconciling removes every entry the index does not list. Nothing pre-existing survives silently (docs/design/0003, dump failure mode 3).
+    PolicyRestoreTarget,
     /// `policy.sidecar_content`: A content read through a sidecar fails with a distinct 'content not present' error, never a digest error.
     PolicySidecarContent,
 }
@@ -265,6 +267,7 @@ impl Rule {
         Rule::WriterRegisteredTypes,
         Rule::WriterHeapMinimal,
         Rule::PolicyUnverifiedContent,
+        Rule::PolicyRestoreTarget,
         Rule::PolicySidecarContent,
     ];
 
@@ -350,6 +353,7 @@ impl Rule {
             Rule::WriterRegisteredTypes => "writer.registered_types",
             Rule::WriterHeapMinimal => "writer.heap_minimal",
             Rule::PolicyUnverifiedContent => "policy.unverified_content",
+            Rule::PolicyRestoreTarget => "policy.restore_target",
             Rule::PolicySidecarContent => "policy.sidecar_content",
         }
     }
@@ -436,6 +440,7 @@ impl Rule {
             Rule::WriterRegisteredTypes => Level::Must,
             Rule::WriterHeapMinimal => Level::Should,
             Rule::PolicyUnverifiedContent => Level::Must,
+            Rule::PolicyRestoreTarget => Level::Must,
             Rule::PolicySidecarContent => Level::Must,
         }
     }
@@ -522,6 +527,7 @@ impl Rule {
             Rule::WriterRegisteredTypes => Scope::Writer,
             Rule::WriterHeapMinimal => Scope::Writer,
             Rule::PolicyUnverifiedContent => Scope::Behaviour,
+            Rule::PolicyRestoreTarget => Scope::Behaviour,
             Rule::PolicySidecarContent => Scope::Behaviour,
         }
     }
@@ -608,6 +614,7 @@ impl Rule {
             Rule::WriterRegisteredTypes => None,
             Rule::WriterHeapMinimal => None,
             Rule::PolicyUnverifiedContent => None,
+            Rule::PolicyRestoreTarget => None,
             Rule::PolicySidecarContent => None,
         }
     }
@@ -694,6 +701,7 @@ impl Rule {
             Rule::WriterRegisteredTypes => "A writer MUST NOT write a registered-undefined block type or enum value.",
             Rule::WriterHeapMinimal => "A writer SHOULD NOT emit heap bytes no reference addresses.",
             Rule::PolicyUnverifiedContent => "No tool emits bytes of a DATA block that failed data.payload_digest, data.decode or data.raw_digest. FUSE read returns EIO; restore does not create the file, continues with other files, and exits non-zero naming each failure.",
+            Rule::PolicyRestoreTarget => "A full restore MUST refuse a target directory containing any entry other than an empty lost+found, unless explicitly told to reconcile; reconciling removes every entry the index does not list. Nothing pre-existing survives silently (docs/design/0003, dump failure mode 3).",
             Rule::PolicySidecarContent => "A content read through a sidecar fails with a distinct 'content not present' error, never a digest error.",
         }
     }
@@ -780,6 +788,7 @@ impl Rule {
             Rule::WriterRegisteredTypes => &[],
             Rule::WriterHeapMinimal => &[],
             Rule::PolicyUnverifiedContent => &[],
+            Rule::PolicyRestoreTarget => &[],
             Rule::PolicySidecarContent => &[],
         }
     }

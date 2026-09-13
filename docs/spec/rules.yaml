@@ -509,6 +509,11 @@ rules:
     scope: behaviour
     text: "No tool emits bytes of a DATA block that failed data.payload_digest, data.decode or data.raw_digest. FUSE read returns EIO; restore does not create the file, continues with other files, and exits non-zero naming each failure."
     no_fixture_because: "Tool behaviour over a file the corpus already contains (data-raw-digest); tested by diavolo-fuse and diavolo-cli tests."
+  - id: policy.restore_target
+    level: MUST
+    scope: behaviour
+    text: "A full restore MUST refuse a target directory containing any entry other than an empty lost+found, unless explicitly told to reconcile; reconciling removes every entry the index does not list. Nothing pre-existing survives silently (docs/design/0003, dump failure mode 3)."
+    no_fixture_because: "Tool behaviour against a target directory, not a property of any archive; tested by diavolo-cli restore tests."
   - id: policy.sidecar_content
     level: MUST
     scope: behaviour
