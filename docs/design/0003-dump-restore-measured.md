@@ -46,15 +46,15 @@ vacuously. Run A closes that hole.
   `restoresymtable` is a hard error. It becomes silent only if the operator reacts by
   switching to `-x`, and that is failure mode 1. The 0.4b56 source agrees:
   `initsymtable()` calls `errx(1, …)` when the file cannot be opened.
+  - There is a silent variant this test does **not** cover: a pass run from a cwd
+    that contains a *different* `restoresymtable`. It is unmeasured.
+- **Modes 1 and 3 are confirmed silent**, exactly as described.
 - **All of the above is measured on 0.4b56 only.** Whether 0.4b52 behaves the same
   way is unmeasured, and its binary is gone. Two things still depend on 0.4b52:
   - the `strings` evidence in SOLUTIONS.md was taken from it;
   - the real 233 GiB chain was *written* by it.
 
   Restoring that chain with 0.4b56 is a cross-version restore that nobody has tested.
-  - There is a silent variant this test does **not** cover: a pass run from a cwd
-    that contains a *different* `restoresymtable`. It is unmeasured.
-- **Modes 1 and 3 are confirmed silent**, exactly as described.
 
 These corrections belong in `~/tmp/system/SOLUTIONS.md` §2026-09-13 and in the brief.
 Those are owned elsewhere, so they are recorded here and reported to kgr, not edited.
