@@ -162,3 +162,53 @@ path remained.
 
 It prints the full trace, and it checks that unchanged files keep their inode
 numbers.
+
+## Addendum 3 — the traced proof, run by kgr at 20:39
+
+`tools/dump-deletion-proof.sh`, run as root, on dump/restore 0.4b56 with strace 7.1.
+
+**L1 was a genuine incremental.** It lists only `.`, `RECREATED-file` (inode 20) and
+`LINK-kept` (inode 19). It does not mention `DELETED-file`, `DELETED-dir`,
+`DELETED-dir/child` or `LINK-removed`.
+
+**Every unlink, rmdir and rename made by `restore -rf L1.dump`**, apart from
+restore's two temporary files in `/tmp`:
+
+```
+rename("./DELETED-dir", "./RSTTMP013") = 0
+unlink("./RSTTMP013/child")       = 0
+unlink("./DELETED-file")          = 0
+unlink("./RECREATED-file")        = 0
+unlink("./LINK-removed")          = 0
+rmdir("./RSTTMP013")              = 0
+unlink("./LINK-kept")             = 0
+```
+
+After the L1 pass:
+
+- **Kept, untouched:** `UNCHANGED-file` and `UNCHANGED-dir/file` keep their inode
+  numbers (8393806, 8393805), and restore made no syscall on either.
+- **Re-extracted, with correct content:** `RECREATED-file` (`new`) and `LINK-kept`
+  (`linked`, nlink 1).
+- **Control:** `restore -x` made **no** removal syscalls, and all three deleted paths
+  remained.
+
+**So restore -r removes files that L1 does not even name.** It does this from the
+used-inode map, as the addendum above describes, and makes the unlink and rmdir calls
+itself. Plain-file deletion is now shown directly, which closes the gap in
+addendum 2.
+
+**Two checks failed as first written. Both were wrong predictions in the checker, not
+wrong restore behaviour:**
+
+1. **The child was unlinked as `./RSTTMP013/child`, not `./DELETED-dir/child`.**
+   `removeoldleaves()` walks inodes in ascending order (`restore.c:208`). The directory
+   (inode 13) was renamed aside before the child (inode 14) was reached. In run A the
+   order was reversed (2049 against 17).
+2. **`LINK-kept` is not unchanged.** Dropping `LINK-removed` changed its link count and
+   ctime, so L1 re-dumped it and restore re-extracted it.
+
+The checks were corrected, then re-run as kgr (not root) against the kept evidence
+in `/var/tmp/dump-deletion-proof`: 18 of 18 pass. A negative control ran the same
+corrected verdict against the `-x` evidence, and every removal check failed. The
+corrected checks can therefore still fail.

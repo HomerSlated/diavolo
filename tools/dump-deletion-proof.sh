@@ -113,8 +113,14 @@ bad() { echo "FAIL  $*"; fail=1; }
 t=$W/r.trace
 grep -a -q 'unlink("./DELETED-file")' "$t" &&
 	ok "restore -r called unlink on DELETED-file" || bad "no unlink of DELETED-file in the trace"
-grep -a -q 'unlink("./DELETED-dir/child")' "$t" &&
-	ok "restore -r called unlink on DELETED-dir/child" || bad "no unlink of DELETED-dir/child"
+# removeoldleaves() walks inodes in ascending order. If the directory's inode is
+# lower than the child's, the directory is renamed aside first and the child is
+# unlinked under the temporary name, so accept either path.
+tmp=$(sed -n 's/.*rename("\.\/DELETED-dir", "\.\/\(RSTTMP[0-9]*\)").*/\1/p' "$t")
+if grep -a -q 'unlink("./DELETED-dir/child")' "$t" ||
+   { [ -n "$tmp" ] && grep -a -q "unlink(\"./$tmp/child\")" "$t"; }; then
+	ok "restore -r called unlink on DELETED-dir/child${tmp:+ (as ./$tmp/child)}"
+else bad "no unlink of DELETED-dir/child"; fi
 if grep -a -q 'rename("./DELETED-dir", "./RSTTMP' "$t" && grep -a -q 'rmdir("./RSTTMP' "$t"; then
 	ok "restore -r renamed DELETED-dir aside, then called rmdir on it"
 else bad "no rename+rmdir of DELETED-dir"; fi
@@ -123,7 +129,9 @@ grep -a -q 'unlink("./LINK-removed")' "$t" &&
 for p in DELETED-file DELETED-dir LINK-removed; do
 	[ -e "$W/restore-r/$p" ] && bad "$p still present after restore -r" || ok "$p absent after restore -r"
 done
-for p in UNCHANGED-file UNCHANGED-dir/file LINK-kept; do
+grep -a -q DELETED "$W/L1.list" && bad "L1 mentions DELETED-*" ||
+	ok "L1 does not mention any DELETED-* path, yet restore -r removed them"
+for p in UNCHANGED-file UNCHANGED-dir/file; do
 	a=$(ino_of "$W/after-L0.txt" "$p"); b=$(ino_of "$W/after-L1.txt" "$p")
 	[ -n "$a" ] && [ "$a" = "$b" ] &&
 		ok "$p kept inode $a across the L1 pass (not rebuilt)" || bad "$p inode changed: $a -> $b"
@@ -131,6 +139,10 @@ done
 for p in UNCHANGED-file UNCHANGED-dir/file; do
 	grep -a -q "\"./$p\"" "$t" && bad "restore made a syscall on $p" || ok "restore made no syscall on $p"
 done
+# LINK-kept is NOT unchanged: dropping LINK-removed changed its link count and
+# ctime, so L1 re-dumps it and restore re-extracts it. Check its final state.
+[ "$(cat "$W/restore-r/LINK-kept")" = linked ] && [ "$(stat -c %h "$W/restore-r/LINK-kept")" = 1 ] &&
+	ok "LINK-kept present, content intact, nlink 1" || bad "LINK-kept wrong after restore -r"
 [ "$(cat "$W/restore-r/RECREATED-file")" = new ] &&
 	ok "RECREATED-file has its new content" || bad "RECREATED-file content wrong"
 for p in DELETED-file DELETED-dir LINK-removed; do
