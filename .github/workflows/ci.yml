@@ -27,6 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # xtask must never depend on diavolo-ext4 (docs/design/0002), so this job
+      # deliberately installs no libext2fs headers. If it ever needs them, that is
+      # the bug.
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo xtask codegen
       - run: git diff --exit-code -- docs/generated crates corpus
