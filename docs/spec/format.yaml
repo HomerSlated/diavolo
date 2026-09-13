@@ -1,0 +1,7 @@
+# Diavolo archive format — THE authoritative specification.
+#
+# UNSTABLE until v0.1.0. Archives written before then may become unreadable, and
+# every reader refuses any format version it does not explicitly recognise.
+#
+# This file is the only input the generator reads, together with the files it
+# declares under `inputs:`. Any other file in docs/spec/ is an error.

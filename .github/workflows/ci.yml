@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libext2fs headers
+        run: sudo apt-get update && sudo apt-get install -y libext2fs-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # Regenerate every generated artifact and fail if the committed tree differs.
+  # This is the only thing that catches a hand-edited generated file.
+  docgen-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo xtask codegen
+      - run: git diff --exit-code -- docs/generated crates corpus
+      - name: No untracked generated files
+        run: test -z "$(git status --porcelain --untracked-files=all -- docs/generated crates corpus)"

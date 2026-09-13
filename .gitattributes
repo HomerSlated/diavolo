@@ -1,0 +1,4 @@
+# Conformance archives are byte-exact. No EOL conversion, no textual diff.
+corpus/**/*.dvl binary
+# The hex renderings beside them are the reviewable form.
+corpus/**/*.hex text eol=lf
