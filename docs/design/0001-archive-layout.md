@@ -120,6 +120,18 @@ Every directory record also carries a tombstone range. In 0.x:
 If a later version optimises large unchanged directories, the field that makes that
 safe is already in every file. It would be impossible to add afterwards.
 
+**Prior art: PFS `deldir` (Amiga, ~1993).** The Professional File System (originally
+AmiFileSafe) kept the last few deleted files in a hidden root directory, recoverable
+until space pressure evicted them — a recycle bin *in the filesystem*, not bypassable
+from a shell like the desktop trash. It is the ancestor of this whole approach:
+treating a deletion as a recorded fact with retained recoverability, not immediate
+destruction. Diavolo takes it to the limit — the archive is immutable and append-only,
+so nothing is ever destroyed, and D3 makes every index a point-in-time namespace to
+recover from. The reserved tombstone range is where an explicit "deleted here" fact
+would live if a future version needs to name deletions rather than infer them from a
+namespace diff. (PFS also used copy-on-write metadata updates cascading to the root
+block, the ZFS/Btrfs/ReFS mechanism, a decade before those filesystems.)
+
 **Rejected: "dir unchanged, see ancestor" records in 0.1.** That form is positive
 and verifiable, provided it carries the ancestor record's digest. But it
 re-introduces chain-dependent namespace resolution. Reserve it; don't build it.
