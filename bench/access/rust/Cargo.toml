@@ -1,0 +1,19 @@
+[package]
+name = "accbench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Storage access-method benchmark, Rust peer of ../c/accbench.c"
+
+[dependencies]
+libc = "0.2"
+
+# Parity with the C build: one codegen unit (like one translation unit), no
+# unwinding (C has none), no LTO in either. target-cpu=native is in
+# .cargo/config.toml, matching -march=native.
+[profile.release]
+codegen-units = 1
+panic = "abort"
+
+# Standalone: deliberately not a member of the Diavolo workspace.
+[workspace]
