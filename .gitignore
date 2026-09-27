@@ -3,3 +3,6 @@
 # fails on any diff. Do not add crates/*/src/generated/, docs/generated/ or
 # corpus/ here.
 /private/
+
+# Claude Code agent definitions: local setup, not project source (as in accudisc).
+/.claude/
