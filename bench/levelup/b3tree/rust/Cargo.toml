@@ -1,0 +1,29 @@
+[package]
+name = "b3tree"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Rust peer of ../b3tree.c: the same proof and speed test on blake3::hazmat"
+
+[dependencies]
+blake3 = "=1.8.7"
+
+[features]
+# Like C's asm flavour: AVX2 + SSE4.1 kernels only (the crate still dispatches).
+lean = ["blake3/no_avx512", "blake3/no_sse2"]
+
+[profile.release]
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Standalone: deliberately not a member of the Diavolo workspace.
+[workspace]
+
+# Rust's own best for size, for the size probe: everything C gets from -s,
+# plus what only Rust needs (LTO across std, smallest opt level).
+[profile.small]
+inherits = "release"
+opt-level = "z"
+lto = true
+strip = true

@@ -975,6 +975,13 @@ static void m_rawsort(const char *dev)
 			}
 		}
 	}
+	const char *dump = getenv("ACCBENCH_PLAN_DUMP");
+	if (dump) {	/* for bench/levelup/sort: the unsorted plan, then stop */
+		FILE *f = fopen(dump, "wb");
+		if (!f || fwrite(pc, sizeof *pc, np, f) != np || fclose(f))
+			die("%s", dump);
+		exit(0);
+	}
 	qsort(pc, np, sizeof *pc, cmp_piece);
 	if (g_hash) {
 		if (!(g_fs = calloc(g_nfl, sizeof *g_fs)))

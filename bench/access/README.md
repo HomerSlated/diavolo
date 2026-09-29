@@ -133,6 +133,11 @@ smoke run's small images can't end up inside a full run's results. The steps are
 `verify`, `bench` and `trace`, and `all` runs all four; `clean` deletes the
 images but keeps the results.
 
+The C build also reads `ACCBENCH_PLAN_DUMP=FILE`: `rawsort` then writes its
+unsorted read plan (`piece_t[]`, 24 bytes per piece) to `FILE` and exits without
+reading any data. `../levelup/sort` uses the dumps. The images are world-readable,
+so this runs as yourself: `ACCBENCH_PLAN_DUMP=x.plan c/build/accbench-gcc rawsort IMAGE`.
+
 ## Know before you trust the numbers
 
 - **Only the one machine is measured.** Each run records its environment in

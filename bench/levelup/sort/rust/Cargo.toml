@@ -1,0 +1,13 @@
+[package]
+name = "sortbench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Rust peer of ../sortbench.c: the read plan's sort in isolation"
+
+[profile.release]
+codegen-units = 1
+panic = "abort"
+
+# Standalone: deliberately not a member of the Diavolo workspace.
+[workspace]

@@ -1,0 +1,23 @@
+[package]
+name = "parhash"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Rust peer of ../parhash.c: the same pieces on rayon"
+
+[dependencies]
+blake3 = { version = "=1.8.7", features = ["rayon"] }
+rayon = "1"
+
+[profile.release]
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.small]
+inherits = "release"
+opt-level = "z"
+lto = true
+
+# Standalone: deliberately not a member of the Diavolo workspace.
+[workspace]
