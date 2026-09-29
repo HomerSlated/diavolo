@@ -7,7 +7,8 @@ answers two questions with measurements instead of inference:
 2. **Does the implementation language matter?** Every method is written twice,
    in C (built with both gcc and clang) and in Rust. The two versions are
    line-for-line peers: the same syscalls, the same 1 MiB buffer, the same hash
-   and the same output format.
+   and the same output format. Each uses its own language's tools for the
+   hash, the sort and the threads (see "Hashing" below).
 
 ## The three access methods
 
@@ -20,13 +21,10 @@ answers two questions with measurements instead of inference:
 | 3 | Raw parse | `raw` | hand-written ext4 reader (superblock, group descriptors, inode tables, extent trees, directory blocks) | own `pread` on the device, file by file in inode order | |
 | 3 | Raw parse | `rawsort` | the same reader as `raw` | every extent of every file sorted by disk address; physically adjacent pieces are merged into one `pread` even across files | a candidate for Diavolo's read path |
 
-`rawsort` reads in disk order, but each file's digest still has to be computed
-over its bytes in logical order. So bytes that arrive early (a fragmented file
-whose later extents sit lower on disk) are held in memory until the file's
-cursor reaches them. It prints the most it ever held back; `maxrss` shows the
-cost. Without hashing (the `cold` and `warm` regimes), nothing is held. An
-archive that records each chunk's logical offset would never need to hold
-anything back, because it could store the chunks in the order they're read.
+`rawsort` reads in disk order, so a fragmented file's pieces arrive out of
+order. Its digest doesn't care: see "Hashing". Until 2026-09-29 the hash had to
+see bytes in order, so `rawsort` held early pieces in memory, up to 1.98 GiB on
+`huge-aged`; it now holds none.
 
 `e2fs` and `raw` share the transfer code in each language. The only difference
 between them is who parses the metadata: the library, or our own code.
@@ -35,6 +33,43 @@ between them is who parses the metadata: the library, or our own code.
 the directory walk remains. What changes is that files are opened by kernel
 handle, in inode order, instead of by path in walk order. `bulkstat` is the
 faithful xfsdump method, so XFS images are included to show it.
+
+## Hashing
+
+With `--hash` (the `*-hash` regimes and the gate), every file's digest is
+**BLAKE3 of its logical bytes, holes as zeros**, so it equals `b3sum` of the
+file. Each method hands the engine `(file, logical offset, bytes)` in whatever
+order it reads them.
+
+**How a digest is built:**
+
+- Each delivery is split into aligned power-of-two subtrees of 1 KiB–1 MiB.
+- Each subtree is hashed to a BLAKE3 chaining value at once, and kept as 48
+  bytes.
+- When a file's delivered bytes reach the bytes it has on disk, its subtrees
+  are merged in tree order. Holes and uninitialised extents become zero
+  subtrees.
+- Arrival order doesn't matter, and nothing is ever held back. This is
+  advisor report P1.1, proven in `../levelup/b3tree`.
+
+**What each language uses:**
+
+| | C | Rust |
+|---|---|---|
+| subtree CVs and merge | `../levelup/b3tree` (our tree layer, upstream asm kernels) | `blake3::hazmat` |
+| sorts (`rawsort` plan, `handle` inode order, per-file subtrees) | `../levelup/sort/radix.h` | a copy of the same radix sort (`sort_unstable_by_key` for per-file subtrees) |
+| `--threads N` | `../levelup/pool` | `rust/src/pool.rs`, a port of it (rayon measured up to 6 % slower: see `../levelup/README.md`) |
+
+**With `--threads N` (default 1):**
+
+- Reads go into an arena of 2N MiB instead of the 1 MiB buffer.
+- When the arena fills, all its subtrees are hashed in parallel, then the files
+  they completed are merged.
+- Reading itself stays on one thread, and each method's read pattern is
+  unchanged.
+- In both languages the reading thread is one of the N threads.
+
+Hashing time counts as `read_ns`, as before.
 
 ## What every run reports
 
@@ -49,8 +84,8 @@ faithful xfsdump method, so XFS images are included to show it.
 ## The correctness gate
 
 Before anything is timed, every method × implementation on every image writes
-a digest file: `inode size hash` per regular file, plus counts of files, names
-and bytes. All of them must be **byte-identical**, and must have found at least
+a digest file: `inode size blake3` per regular file (64 hex digits), plus
+counts of files, names and bytes. All of them must be **byte-identical**, and must have found at least
 one file. An image that fails is excluded from timing.
 
 This caught three real problems during development:
@@ -125,7 +160,9 @@ python3 bench/access/report.py                # as yourself -> results/latest/re
 
 Knobs (environment variables): `W` (work dir, default `/var/tmp/accbench`),
 `SCALE`, `REPS` (3), `REGIMES`, `EXT4_SETS`, `XFS_SETS`, `TRACE_SETS`,
-`REAL_SRC`, `CPU` (2), `FORCE=1` (rebuild images), `METHODS` (for example
+`REAL_SRC`, `CPU` (2), `THREADS` (1: `--threads` for `verify` and the
+`*-hash` regimes), `CPUS` (all: where runs with `THREADS` > 1 are pinned),
+`FORCE=1` (rebuild images), `METHODS` (for example
 `"vfs raw rawsort"`, to time only those). Each image records the `SCALE`
 and `REAL_SRC` it was built with, on the first line of its `.info` file. An image
 built with other values is rebuilt by `prepare` and never verified or timed. So a
@@ -159,17 +196,21 @@ so this runs as yourself: `ACCBENCH_PLAN_DUMP=x.plan c/build/accbench-gcc rawsor
   - libext2fs's default 8-block inode-scan buffer: both raw readers scan 1 MiB
     at a time, so `e2fs` versus `raw` compares parsers, not buffer sizes.
 - **Not covered:**
-  - io_uring and multithreading: that's the concurrency axis, not access;
+  - io_uring and multithreaded reading: that's the concurrency axis, not
+    access (`--threads` parallelises only the hashing);
   - O_DIRECT: that's the cache-path axis;
   - `raw` does not handle block-mapped files, inline data or meta_bg. The
     images are made without them, and `raw` refuses rather than misreads.
-- **The content hash isn't cryptographic.** It is a fast 64-bit fingerprint,
-  defined identically in both languages.
+- **The content hash is BLAKE3 since 2026-09-29.** Before that it was a fast,
+  non-cryptographic 64-bit fingerprint, so `*-hash` timings from earlier runs
+  aren't comparable with later ones. Verify stamps now carry `hash=blake3`, and
+  `bench` skips images whose stamp lacks it, so run `verify` (or `all`) once.
 
 ## Layout
 
 ```
-c/accbench.c          C implementation (make builds accbench-gcc and accbench-clang)
+c/accbench.c          C implementation (make builds accbench-gcc, accbench-clang; accbench-tsan on request)
+../levelup/           b3tree, radix.h and pool, compiled into the C build
 rust/src/*.rs         Rust implementation (standalone Cargo package, own [workspace])
 rust/src/sys/*.rs     bindgen output for libext2fs and XFS; regenerate with rust/gen-bindings.sh
 gen/mkset.py          file-set generator

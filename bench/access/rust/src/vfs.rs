@@ -49,7 +49,7 @@ fn dir(ctx: &mut Ctx, dfd: c_int) {
                 if f < 0 {
                     die_os(format_args!("openat {}", name.to_string_lossy()));
                 }
-                let (n, dg) = ctx.read_stream(f);
+                let n = ctx.read_stream(f, st.st_ino, st.st_size as u64);
                 if n != st.st_size as u64 {
                     die(format_args!(
                         "{}: read {n} of {} bytes",
@@ -57,7 +57,9 @@ fn dir(ctx: &mut Ctx, dfd: c_int) {
                         st.st_size
                     ));
                 }
-                ctx.add_record(st.st_ino, n, dg);
+                if !ctx.hash {
+                    ctx.add_record(st.st_ino, n, [0; 32]);
+                }
                 unsafe { libc::close(f) };
             }
             _ => {}

@@ -12,7 +12,7 @@
 # (strace -c). Afterwards, as yourself: python3 bench/access/report.py
 #
 # Knobs (environment): W SCALE REPS REGIMES EXT4_SETS XFS_SETS TRACE_SETS
-# REAL_SRC CPU FORCE METHODS. Defaults below; see README.md.
+# REAL_SRC CPU THREADS CPUS FORCE METHODS. Defaults below; see README.md.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -25,6 +25,8 @@ XFS_SETS=${XFS_SETS-"tiny-aged-random small-aged-random mixed-aged-random real-a
 TRACE_SETS=${TRACE_SETS-"small-aged-random mixed-aged-random"}
 REAL_SRC=${REAL_SRC:-/usr/share}
 CPU=${CPU:-2}
+THREADS=${THREADS:-1}                       # --threads for hashing runs (verify and *-hash)
+CPUS=${CPUS:-0-$(($(nproc) - 1))}           # where THREADS > 1 runs are pinned
 FORCE=${FORCE:-0}
 METHODS=${METHODS:-}
 IMPLS="$HERE/c/build/accbench-gcc $HERE/c/build/accbench-clang $HERE/rust/target/release/accbench"
@@ -41,6 +43,11 @@ methods_for() {
 	for m in $all; do case " $METHODS " in *" $m "*) printf '%s ' "$m" ;; esac; done; echo
 }
 target_for() { case $1 in e2fs|raw|rawsort) echo "$LOOP" ;; *) echo "$MNT" ;; esac; }
+# The CPUs a run is pinned to: one for single-threaded runs, CPUS for the pool's.
+pin_for() { if [ "$THREADS" -gt 1 ] && [ -n "$1" ]; then echo "$CPUS"; else echo "$CPU"; fi; }
+# Stamps written by verify carry the hash scheme, so a stamp from before the
+# switch to BLAKE3 (2026-09-29) can't let an unverified image be timed.
+HASH_TAG=hash=blake3
 impl_name() { case $1 in *accbench-gcc) echo c-gcc ;; *accbench-clang) echo c-clang ;; *) echo rust ;; esac; }
 
 detach() {
@@ -142,7 +149,7 @@ verify_one() {
 	for m in $(methods_for "$fs"); do
 		for b in $IMPLS; do
 			d=$W/dig/$fs-$set.$(impl_name "$b").$m
-			if ! "$b" "$m" "$(target_for "$m")" --digest "$d" > /dev/null; then
+			if ! "$b" "$m" "$(target_for "$m")" --digest "$d" --threads "$THREADS" > /dev/null; then
 				echo "    FAIL: $(impl_name "$b") $m exited non-zero"; ok=0; continue
 			fi
 			files=$(head -1 "$d" | sed 's/.*files=\([0-9]*\).*/\1/')
@@ -155,7 +162,7 @@ verify_one() {
 	done
 	detach
 	if [ $ok = 1 ]; then
-		head -1 "$ref" > "$img.verified"
+		echo "$(head -1 "$ref") $HASH_TAG threads=$THREADS" > "$img.verified"
 		log "verified $fs $set: $(cat "$img.verified")"
 	else
 		rm -f "$img.verified"
@@ -182,15 +189,16 @@ warm_code() { [ -n "$CODE" ] || CODE=$(code_files); cat $CODE > /dev/null; }
 perf_ok=0
 bench_run() {  # fs set regime rep impl method
 	b=$5 m=$6 hash=
-	case $3 in *-hash) hash=--hash ;; esac
+	case $3 in *-hash) hash="--hash --threads $THREADS" ;; esac
+	pin=$(pin_for "$hash")
 	case $3 in cold*) sync; echo 3 > /proc/sys/vm/drop_caches; warm_code ;; esac
 	set -- "$@" "$(dev_stat)"
 	if [ $perf_ok = 1 ]; then
-		line=$(taskset -c "$CPU" perf stat -x, -o "$W/perf.tmp" \
+		line=$(taskset -c "$pin" perf stat -x, -o "$W/perf.tmp" \
 			-e cycles:u,instructions:u,cycles:k,instructions:k -- "$b" "$m" "$(target_for "$m")" $hash)
 		pc=$(awk -F, '/cycles:u/{a=$1} /instructions:u/{b=$1} /cycles:k/{c=$1} /instructions:k/{d=$1} END{print a","b","c","d}' "$W/perf.tmp")
 	else
-		line=$(taskset -c "$CPU" "$b" "$m" "$(target_for "$m")" $hash)
+		line=$(taskset -c "$pin" "$b" "$m" "$(target_for "$m")" $hash)
 		pc=",,,"
 	fi
 	after=$(dev_stat)
@@ -202,7 +210,7 @@ bench_run() {  # fs set regime rep impl method
 bench_one() {
 	fs=$1 set=$2 img=$W/img/$1-$2.img
 	current "$img" || { log "skip bench $fs $set: not prepared with $(params)"; return; }
-	[ -f "$img.verified" ] || { log "skip bench $fs $set: not verified"; return; }
+	grep -q " $HASH_TAG " "$img.verified" 2>/dev/null || { log "skip bench $fs $set: not verified (with $HASH_TAG)"; return; }
 	attach "$img" ro
 	for regime in $REGIMES; do
 		case $regime in warm*)   # warm every cache a method uses: file pages and device pages
@@ -226,7 +234,7 @@ write_env() {
 		echo "date: $(date -Is)"
 		echo "kernel: $(uname -r)"
 		echo "cmdline: $(cat /proc/cmdline)"
-		echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-) (runs pinned to cpu $CPU)"
+		echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-) (runs pinned to cpu $CPU; hashing with $THREADS thread(s)$([ "$THREADS" -gt 1 ] && echo " on cpus $CPUS"))"
 		echo "governor: $(cat /sys/devices/system/cpu/cpu$CPU/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
 		echo "gcc: $(gcc --version | head -1)"
 		echo "clang: $(clang --version | head -1)"
@@ -236,7 +244,8 @@ write_env() {
 		echo "repo: $(git -C "$HERE" rev-parse --short HEAD 2>/dev/null)$(git -C "$HERE" diff --quiet 2>/dev/null || echo ' (dirty)')"
 		echo "images on: $(df -h "$W/img" | tail -1)"
 		echo "backing device rotational: $(lsblk -no ROTA "$(df --output=source "$W/img" | tail -1)" 2>/dev/null | head -1)"
-		echo "scale=$SCALE reps=$REPS regimes=$REGIMES methods=${METHODS:-all}"
+		echo "scale=$SCALE reps=$REPS regimes=$REGIMES methods=${METHODS:-all} threads=$THREADS"
+		echo "content hash: BLAKE3 per file (digests equal b3sum), $HASH_TAG"
 		echo "perf counters: $([ $perf_ok = 1 ] && echo yes || echo no)"
 		echo "loop devices: direct I/O required and checked on every read-only attach"
 		echo "cold runs re-read after drop_caches: $(code_files | tr '\n' ' ')"
@@ -272,7 +281,7 @@ bench|trace|all)
 		for fs in ext4 xfs; do
 			for s in $TRACE_SETS; do
 				img=$W/img/$fs-$s.img
-				current "$img" && [ -f "$img.verified" ] || continue
+				current "$img" && grep -q " $HASH_TAG " "$img.verified" 2>/dev/null || continue
 				attach "$img" ro
 				for m in $(methods_for "$fs"); do
 					for b in $IMPLS; do

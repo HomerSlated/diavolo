@@ -3,7 +3,7 @@
 
 use std::ffi::{CStr, CString, c_int};
 
-use crate::common::{Ctx, clear_errno, die, die_os, dot_or_dotdot, errno};
+use crate::common::{Ctx, clear_errno, die, die_os, dot_or_dotdot, errno, radix_sort};
 
 const HWORDS: usize = (8 + libc::MAX_HANDLE_SZ as usize) / 8;
 
@@ -95,7 +95,7 @@ pub fn run(ctx: &mut Ctx, mnt: &str) {
         list: Vec::with_capacity(4096),
     };
     walk(ctx, &mut hs, dfd);
-    hs.list.sort_unstable_by_key(|h| h.0); // inode order, as bulkstat gives it
+    radix_sort(&mut hs.list, |h| h.0); // inode order, as bulkstat gives it
     for &(ino, off) in &hs.list {
         let fh = hs.arena[off..].as_ptr() as *mut libc::file_handle;
         let f = unsafe { libc::open_by_handle_at(mfd, fh, libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -106,11 +106,13 @@ pub fn run(ctx: &mut Ctx, mnt: &str) {
         if unsafe { libc::fstat(f, &mut st) } != 0 {
             die_os("fstat");
         }
-        let (n, dg) = ctx.read_stream(f);
+        let n = ctx.read_stream(f, st.st_ino, st.st_size as u64);
         if n != st.st_size as u64 {
             die(format_args!("ino {ino}: short read"));
         }
-        ctx.add_record(st.st_ino, n, dg);
+        if !ctx.hash {
+            ctx.add_record(st.st_ino, n, [0; 32]);
+        }
         unsafe { libc::close(f) };
     }
 }

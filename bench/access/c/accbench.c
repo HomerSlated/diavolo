@@ -4,7 +4,9 @@
  * Reads every regular file on one filesystem by one access method and reports
  * how long it spent finding the data versus reading it. The Rust program in
  * ../rust is a line-for-line peer: same methods, same syscalls, same buffer
- * size, same hash, same output. See ../README.md.
+ * size, same hash, same output; the Rust side uses its own BLAKE3, sort and
+ * thread pool (blake3::hazmat, and ports of the radix sort and the pool).
+ * See ../README.md.
  *
  *   accbench vfs      MOUNTPOINT   method 1: lstat + open + read by path
  *   accbench handle   MOUNTPOINT   method 2: walk, name_to_handle_at, inode order, open_by_handle_at
@@ -13,8 +15,10 @@
  *   accbench raw      DEVICE       method 3: hand-written ext4 parser, own pread of data
  *   accbench rawsort  DEVICE       method 3: as raw, but all extents of all files in disk order
  *
- * Options: --hash (hash all file content), --digest FILE (implies --hash; write
- * "ino size digest" per file, sorted by inode), --header (print CSV header only).
+ * Options: --hash (BLAKE3 of all file content, holes as zeros: equals b3sum),
+ * --digest FILE (implies --hash; write "ino size digest" per file, sorted by
+ * inode), --threads N (hash on N threads; default 1, inline), --header (print
+ * CSV header only).
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -34,6 +38,10 @@
 
 #include <ext2fs/ext2fs.h>
 #include <xfs/xfs.h>
+
+#include "../../levelup/b3tree/b3tree.h"
+#include "../../levelup/pool/pool.h"
+#include "../../levelup/sort/radix.h"
 
 #ifdef __clang__
 static const char *IMPL = "c-clang";
@@ -69,16 +77,6 @@ static uint64_t now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }
 
-/* ---- content hash (identical in Rust; not cryptographic, just a fingerprint) ---- */
-
-typedef struct {
-	uint64_t h, len, pend;
-	unsigned npend;
-} hstate;
-
-static inline uint64_t rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
-static inline uint64_t absorb(uint64_t h, uint64_t w) { return rotl(h ^ w, 27) * HK; }
-
 static inline uint64_t fmix(uint64_t h)
 {
 	h ^= h >> 33;
@@ -89,68 +87,17 @@ static inline uint64_t fmix(uint64_t h)
 	return h;
 }
 
-static void h_init(hstate *s)
-{
-	s->h = 0x243F6A8885A308D3ull;
-	s->len = s->pend = 0;
-	s->npend = 0;
-}
-
-static void h_update(hstate *s, const uint8_t *p, size_t n)
-{
-	uint64_t h = s->h;
-	s->len += n;
-	while (s->npend && n) {
-		s->pend |= (uint64_t)*p++ << (8 * s->npend);
-		n--;
-		if (++s->npend == 8) {
-			h = absorb(h, s->pend);
-			s->pend = 0;
-			s->npend = 0;
-		}
-	}
-	while (n >= 8) {
-		uint64_t w;
-		memcpy(&w, p, 8);	/* little-endian host assumed (x86-64) */
-		h = absorb(h, w);
-		p += 8;
-		n -= 8;
-	}
-	while (n) {
-		s->pend |= (uint64_t)*p++ << (8 * s->npend++);
-		n--;
-	}
-	s->h = h;
-}
-
-static void h_zeros(hstate *s, uint64_t n)
-{
-	static const uint8_t z[65536];
-	while (n) {
-		size_t k = n < sizeof z ? (size_t)n : sizeof z;
-		h_update(s, z, k);
-		n -= k;
-	}
-}
-
-static uint64_t h_final(const hstate *s)
-{
-	uint64_t h = s->h;
-	if (s->npend)
-		h = absorb(h, s->pend);
-	return fmix(h ^ s->len);
-}
-
 /* ---- per-file records ---- */
 
 typedef struct {
-	uint64_t ino, size, digest;
+	uint64_t ino, size;
+	uint8_t digest[B3_OUT];
 } rec_t;
 
 static rec_t *g_recs;
 static size_t g_nrecs, g_caprecs;
 
-static void add_record(uint64_t ino, uint64_t size, uint64_t digest)
+static void add_record(uint64_t ino, uint64_t size, const uint8_t *digest)
 {
 	if (g_nrecs == g_caprecs) {
 		g_caprecs = g_caprecs ? g_caprecs * 2 : 4096;
@@ -158,18 +105,23 @@ static void add_record(uint64_t ino, uint64_t size, uint64_t digest)
 		if (!g_recs)
 			die("out of memory");
 	}
-	g_recs[g_nrecs++] = (rec_t){ ino, size, digest };
+	rec_t *r = &g_recs[g_nrecs++];
+	r->ino = ino;
+	r->size = size;
 	g_files++;
 	g_bytes += size;
-	if (g_hash)
-		g_combined += fmix(digest ^ (ino * HK));
+	if (digest) {
+		uint64_t w;
+		memcpy(r->digest, digest, B3_OUT);
+		memcpy(&w, digest, 8);	/* little-endian host assumed (x86-64) */
+		g_combined += fmix(w ^ (ino * HK));
+	} else {
+		memset(r->digest, 0, B3_OUT);
+	}
 }
 
-static int cmp_rec(const void *a, const void *b)
-{
-	uint64_t x = ((const rec_t *)a)->ino, y = ((const rec_t *)b)->ino;
-	return (x > y) - (x < y);
-}
+#define INO(x) ((x).ino)
+RADIX_DEFINE(sort_recs, rec_t, INO)
 
 /* ---- inode set: open addressing, key 0 = empty (inode 0 never exists) ---- */
 
@@ -208,29 +160,270 @@ static int iset_add(iset *s, uint64_t ino)
 	return 1;
 }
 
+/*
+ * ---- content hash: BLAKE3 of each file's logical bytes, holes as zeros ----
+ *
+ * Every method delivers a file's bytes as (logical offset, data), in whatever
+ * order it reads them. Each delivery is split into aligned power-of-two
+ * subtrees of 1 KiB..1 MiB, hashed to BLAKE3 chaining values on the spot
+ * (b3tree), and kept as 48 bytes each. When a file's delivered bytes reach
+ * the bytes it has on disk, its subtrees are merged in tree order, with holes
+ * and uninitialised extents hashed as zero subtrees. The digest equals b3sum
+ * of the file, whatever the arrival order, and no data is ever held back.
+ *
+ * With --threads N > 1, reads land in an arena of 2N MiB instead of g_buf;
+ * when it fills, the pool hashes all its subtrees at once, then the files
+ * they completed are merged. The Rust peer does the same with a port of the
+ * pool.
+ */
+
+typedef struct {
+	uint64_t off, len;
+	uint8_t cv[B3_OUT];
+} run_t;
+
+typedef struct {
+	uint64_t ino, size, need, got;	/* need: bytes to be delivered (size less holes) */
+	run_t *r;
+	uint32_t nr, cap;
+	int whole;	/* r[0] is the entire file, so its cv is the root */
+	int done;
+} hfile_t;
+
+static hfile_t *g_hf;
+static size_t g_nhf, g_caphf;
+static uint8_t g_zero[1u << 20];	/* never written: .bss, not file size */
+static run_t *g_rtmp;
+static size_t g_caprtmp;
+
+/* batch mode (--threads > 1) */
+typedef struct {
+	const uint8_t *p;
+	uint32_t f, i;	/* file, run index: the run arrays may move until the flush */
+} job_t;
+
+static unsigned g_threads = 1;
+static pool *g_pool;
+static uint8_t *g_arena;
+static size_t g_arena_sz, g_fill;
+static job_t *g_jobs;
+static size_t g_njobs, g_capjobs;
+static uint32_t *g_done;
+static size_t g_ndone, g_capdone;
+
+#define GROW(v, n, cap, init)                                                          \
+	do {                                                                           \
+		if ((n) == (cap)) {                                                    \
+			(cap) = (cap) ? (cap) * 2 : (init);                            \
+			if (!((v) = realloc((v), (cap) * sizeof *(v))))                \
+				die("out of memory");                                  \
+		}                                                                      \
+	} while (0)
+
+static void zero_cv(uint64_t off, uint64_t len, uint8_t cv[B3_OUT])
+{
+	if (len > sizeof g_zero) {	/* a long hole: its own subtrees, merged */
+		uint8_t l[B3_OUT], r[B3_OUT];
+		uint64_t ll = b3_left_len(len);
+		zero_cv(off, ll, l);
+		zero_cv(off + ll, len - ll, r);
+		b3_parent(l, r, cv);
+	} else {
+		b3_subtree(g_zero, len, off, cv);
+	}
+}
+
+/* first run with offset >= off; runs are sorted by offset */
+static uint32_t lower(const hfile_t *f, uint64_t off)
+{
+	uint32_t lo = 0, hi = f->nr;
+	while (lo < hi) {
+		uint32_t m = (lo + hi) / 2;
+		if (f->r[m].off < off)
+			lo = m + 1;
+		else
+			hi = m;
+	}
+	return lo;
+}
+
+static void node(const hfile_t *f, uint64_t off, uint64_t len, uint8_t cv[B3_OUT])
+{
+	uint32_t i = lower(f, off), j;
+	if (i < f->nr && f->r[i].off == off && f->r[i].len == len) {
+		memcpy(cv, f->r[i].cv, B3_OUT);
+		return;
+	}
+	j = lower(f, off + len);	/* any run inside [off, off+len)? */
+	if (!(j > 0 && f->r[j - 1].off + f->r[j - 1].len > off)) {
+		zero_cv(off, len, cv);	/* a hole */
+		return;
+	}
+	if (len <= B3_CHUNK) {
+		errno = 0;
+		die("ino %" PRIu64 ": subtree misaligned at %" PRIu64, f->ino, off);
+	}
+	uint8_t l[B3_OUT], r[B3_OUT];
+	uint64_t ll = b3_left_len(len);
+	node(f, off, ll, l);
+	node(f, off + ll, len - ll, r);
+	b3_parent(l, r, cv);
+}
+
+#define OFF(x) ((x).off)
+RADIX_DEFINE(sort_runs, run_t, OFF)
+
+static void hf_finish(uint32_t fid)
+{
+	hfile_t *f = &g_hf[fid];
+	uint8_t d[B3_OUT];
+	if (f->whole) {
+		memcpy(d, f->r[0].cv, B3_OUT);
+	} else if (f->size <= B3_CHUNK) {
+		b3_hash(g_zero, f->size, d);	/* empty, or all hole */
+	} else {
+		if (f->nr > g_caprtmp && !(g_rtmp = realloc(g_rtmp, (g_caprtmp = f->nr) * sizeof *g_rtmp)))
+			die("out of memory");
+		sort_runs(f->r, f->nr, g_rtmp);
+		uint8_t l[B3_OUT], r[B3_OUT];
+		uint64_t ll = b3_left_len(f->size);
+		node(f, 0, ll, l);
+		node(f, ll, f->size - ll, r);
+		b3_root_parent(l, r, d);
+	}
+	add_record(f->ino, f->size, d);
+	f->done = 1;
+	free(f->r);
+	f->r = NULL;
+	f->nr = f->cap = 0;
+}
+
+/* Start hashing a file of size bytes, need of them to be delivered. */
+static uint32_t hf_open(uint64_t ino, uint64_t size, uint64_t need)
+{
+	GROW(g_hf, g_nhf, g_caphf, 4096);
+	uint32_t fid = (uint32_t)g_nhf++;
+	g_hf[fid] = (hfile_t){ .ino = ino, .size = size, .need = need };
+	if (!need)
+		hf_finish(fid);	/* empty or all hole: nothing will arrive */
+	return fid;
+}
+
+static void job_run(void *ctx, size_t i)
+{
+	(void)ctx;
+	const job_t *j = &g_jobs[i];
+	const hfile_t *f = &g_hf[j->f];
+	run_t *r = &f->r[j->i];
+	if (f->whole)
+		b3_hash(j->p, r->len, r->cv);
+	else
+		b3_subtree(j->p, r->len, r->off, r->cv);
+}
+
+static void hb_flush(void)
+{
+	if (g_njobs)
+		pool_for(g_pool, g_njobs, job_run, NULL);
+	g_njobs = g_fill = 0;
+	for (size_t i = 0; i < g_ndone; i++)
+		hf_finish(g_done[i]);
+	g_ndone = 0;
+}
+
+/*
+ * Where to read the next want (<= BUFSZ) bytes that will be delivered; then
+ * hb_used(bytes read), once the deliveries from that read are made.
+ */
+static uint8_t *hb_buf(size_t want)
+{
+	if (g_threads == 1 || !g_hash)
+		return g_buf;	/* delivered and hashed before the next read */
+	if (g_fill + want > g_arena_sz)
+		hb_flush();
+	return g_arena + g_fill;
+}
+
+static void hb_used(size_t n)
+{
+	if (g_threads > 1 && g_hash)
+		g_fill += (n + 63) & ~(size_t)63;
+}
+
+static void deliver(uint32_t fid, uint64_t off, const uint8_t *p, size_t n)
+{
+	hfile_t *f = &g_hf[fid];
+	if (off % B3_CHUNK || (n % B3_CHUNK && off + n != f->size) || off + n > f->size) {
+		errno = 0;
+		die("ino %" PRIu64 ": delivery %" PRIu64 "+%zu misaligned or past EOF", f->ino, off, n);
+	}
+	int batch = g_threads > 1;
+	f->got += n;
+	f->whole = off == 0 && n == f->size;
+	for (uint64_t a = off, b = off + n; a < b;) {
+		uint64_t sz = sizeof g_zero;
+		while (sz > B3_CHUNK && (a % sz || a + sz > b))
+			sz >>= 1;
+		uint64_t len = sz < b - a ? sz : b - a;	/* the file's last chunk may be short */
+		GROW(f->r, f->nr, f->cap, 4);
+		run_t *r = &f->r[f->nr];
+		r->off = a;
+		r->len = f->whole ? n : len;
+		if (batch) {
+			GROW(g_jobs, g_njobs, g_capjobs, 1024);
+			g_jobs[g_njobs++] = (job_t){ p + (a - off), (uint32_t)fid, f->nr };
+		} else if (f->whole) {
+			b3_hash(p, n, r->cv);
+		} else {
+			b3_subtree(p + (a - off), len, a, r->cv);
+		}
+		f->nr++;
+		if (f->whole)
+			break;
+		a += len;
+	}
+	if (f->got == f->need) {
+		if (batch) {
+			GROW(g_done, g_ndone, g_capdone, 1024);
+			g_done[g_ndone++] = fid;
+		} else {
+			hf_finish(fid);
+		}
+	}
+}
+
 /* ---- the shared read loop for fd-based methods (1 and 2) ---- */
 
-static uint64_t read_stream(int fd, uint64_t *digest)
+static uint64_t read_stream(int fd, uint64_t ino, uint64_t size)
 {
-	hstate hs;
 	uint64_t tot = 0;
-	h_init(&hs);
+	uint32_t fid = g_hash ? hf_open(ino, size, size) : 0;
 	for (;;) {
 		uint64_t t0 = now_ns();
-		ssize_t r = read(fd, g_buf, BUFSZ);
-		if (r < 0) {
-			if (errno == EINTR)
-				continue;
-			die("read");
+		uint8_t *buf = hb_buf(BUFSZ);
+		size_t got = 0;
+		ssize_t r = 1;
+		while (got < BUFSZ && (r = read(fd, buf + got, BUFSZ - got)) != 0) {
+			if (r < 0) {
+				if (errno == EINTR)
+					continue;
+				die("read");
+			}
+			got += (size_t)r;	/* fill the buffer, so every delivery is aligned */
 		}
-		if (g_hash && r > 0)
-			h_update(&hs, g_buf, (size_t)r);
+		if (g_hash && got) {
+			if (tot + got > size) {
+				errno = 0;
+				die("ino %" PRIu64 ": grew while being read", ino);
+			}
+			deliver(fid, tot, buf, got);
+			hb_used(got);
+		}
 		g_read_ns += now_ns() - t0;
+		tot += got;
 		if (r == 0)
 			break;
-		tot += (uint64_t)r;
 	}
-	*digest = g_hash ? h_final(&hs) : 0;
 	return tot;
 }
 
@@ -266,14 +459,15 @@ static void vfs_dir(int dfd)
 				die("openat dir %s", nm);
 			vfs_dir(c);
 		} else if (S_ISREG(st.st_mode) && iset_add(&g_seen, st.st_ino)) {
-			uint64_t dg, n;
+			uint64_t n;
 			int f = openat(dirfd(d), nm, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 			if (f < 0)
 				die("openat %s", nm);
-			n = read_stream(f, &dg);
+			n = read_stream(f, st.st_ino, (uint64_t)st.st_size);
 			if (n != (uint64_t)st.st_size)
 				die("%s: read %" PRIu64 " of %" PRIu64 " bytes", nm, n, (uint64_t)st.st_size);
-			add_record(st.st_ino, n, dg);
+			if (!g_hash)
+				add_record(st.st_ino, n, NULL);
 			close(f);
 		}
 	}
@@ -323,11 +517,7 @@ static void h_push(uint64_t ino, const struct file_handle *fh)
 	g_harena_n += need;
 }
 
-static int cmp_hrec(const void *a, const void *b)
-{
-	uint64_t x = ((const hrec *)a)->ino, y = ((const hrec *)b)->ino;
-	return (x > y) - (x < y);
-}
+RADIX_DEFINE(sort_hrecs, hrec, INO)
 
 static void handle_dir(int dfd)
 {
@@ -375,20 +565,25 @@ static void m_handle(const char *mnt)
 	if (mfd < 0 || (dfd = dup(mfd)) < 0)
 		die("open %s", mnt);
 	handle_dir(dfd);
-	qsort(g_h, g_nh, sizeof *g_h, cmp_hrec);	/* inode order, as bulkstat gives it */
+	hrec *tmp = malloc((g_nh ? g_nh : 1) * sizeof *tmp);
+	if (!tmp)
+		die("out of memory");
+	sort_hrecs(g_h, g_nh, tmp);	/* inode order, as bulkstat gives it */
+	free(tmp);
 	for (size_t i = 0; i < g_nh; i++) {
 		struct file_handle *fh = (struct file_handle *)(g_harena + g_h[i].off);
 		struct stat st;
-		uint64_t dg, n;
+		uint64_t n;
 		int f = open_by_handle_at(mfd, fh, O_RDONLY | O_CLOEXEC);
 		if (f < 0)
 			die("open_by_handle_at ino %" PRIu64, g_h[i].ino);
 		if (fstat(f, &st))
 			die("fstat");
-		n = read_stream(f, &dg);
+		n = read_stream(f, st.st_ino, (uint64_t)st.st_size);
 		if (n != (uint64_t)st.st_size)
 			die("ino %" PRIu64 ": short read", g_h[i].ino);
-		add_record(st.st_ino, n, dg);
+		if (!g_hash)
+			add_record(st.st_ino, n, NULL);
 		close(f);
 	}
 }
@@ -464,14 +659,15 @@ static void m_bulkstat(const char *mnt)
 		closedir(d);
 	}
 	for (size_t i = 0; i < nf; i++) {
-		uint64_t dg, n;
+		uint64_t n;
 		int f = xfs_open(mfd, files[i].ino, files[i].gen, O_RDONLY);
 		if (f < 0)
 			die("open ino %" PRIu64, files[i].ino);
-		n = read_stream(f, &dg);
+		n = read_stream(f, files[i].ino, files[i].size);
 		if (n != files[i].size)
 			die("ino %" PRIu64 ": short read", files[i].ino);
-		add_record(files[i].ino, n, dg);
+		if (!g_hash)
+			add_record(files[i].ino, n, NULL);
 		close(f);
 	}
 }
@@ -551,35 +747,40 @@ static void pread_full(int fd, void *buf, size_t n, uint64_t off)
 	}
 }
 
-/* Read one file's extents in logical order, merging runs that are contiguous on disk. */
+/* Bytes of a file that live in initialised extents inside EOF: what reading it delivers. */
+static uint64_t data_bytes(uint32_t bs, const fent *f)
+{
+	uint64_t need = 0;
+	for (size_t i = 0; i < f->n; i++) {
+		const ext_t *e = &g_ex[f->first + i];
+		uint64_t a = e->lblk * bs, b = (e->lblk + e->len) * bs;
+		if (!e->uninit && a < f->size)
+			need += (b < f->size ? b : f->size) - a;
+	}
+	return need;
+}
+
+/*
+ * Read one file's extents in logical order, merging runs that are contiguous
+ * on disk. Holes and uninitialised extents are never read; the hash merge
+ * counts them as zeros.
+ */
 static void xfer_file(int fd, uint32_t bs, const fent *f)
 {
 	const ext_t *ex = g_ex + f->first;
-	uint64_t pos = 0, size = f->size;
-	hstate hs;
+	uint64_t size = f->size;
+	uint32_t fid = 0;
 	size_t i = 0;
-	h_init(&hs);
+	if (g_hash) {
+		uint64_t t0 = now_ns();	/* an empty or all-hole file is hashed here */
+		fid = hf_open(f->ino, size, data_bytes(bs, f));
+		g_read_ns += now_ns() - t0;
+	}
 	while (i < f->n) {
 		uint64_t lstart = ex[i].lblk * bs, end;
 		if (lstart >= size)
 			break;
-		if (lstart > pos) {	/* hole: never read, only hashed as zeros */
-			if (g_hash) {
-				uint64_t t0 = now_ns();
-				h_zeros(&hs, lstart - pos);
-				g_read_ns += now_ns() - t0;
-			}
-			pos = lstart;
-		}
 		if (ex[i].uninit) {
-			end = (ex[i].lblk + ex[i].len) * bs;
-			end = end < size ? end : size;
-			if (g_hash) {
-				uint64_t t0 = now_ns();
-				h_zeros(&hs, end - pos);
-				g_read_ns += now_ns() - t0;
-			}
-			pos = end;
 			i++;
 			continue;
 		}
@@ -589,25 +790,24 @@ static void xfer_file(int fd, uint32_t bs, const fent *f)
 			nb += ex[j++].len;
 		end = (lb + nb) * bs;
 		end = end < size ? end : size;
-		uint64_t off = pb * bs + (pos - lb * bs);
+		uint64_t pos = lstart, off = pb * bs;
 		while (pos < end) {
 			size_t chunk = end - pos < BUFSZ ? (size_t)(end - pos) : BUFSZ;
 			uint64_t t0 = now_ns();
-			pread_full(fd, g_buf, chunk, off);
-			if (g_hash)
-				h_update(&hs, g_buf, chunk);
+			uint8_t *buf = hb_buf(chunk);
+			pread_full(fd, buf, chunk, off);
+			if (g_hash) {
+				deliver(fid, pos, buf, chunk);
+				hb_used(chunk);
+			}
 			g_read_ns += now_ns() - t0;
 			off += chunk;
 			pos += chunk;
 		}
 		i = j;
 	}
-	if (pos < size && g_hash) {	/* trailing hole */
-		uint64_t t0 = now_ns();
-		h_zeros(&hs, size - pos);
-		g_read_ns += now_ns() - t0;
-	}
-	add_record(f->ino, size, g_hash ? h_final(&hs) : 0);
+	if (!g_hash)
+		add_record(f->ino, size, NULL);
 }
 
 static void xfer_all(int fd, uint32_t bs)
@@ -852,113 +1052,16 @@ typedef struct {
 	uint32_t off;	/* first block of this piece within its extent */
 } piece_t;
 
-typedef struct stash {
-	struct stash *next;
-	uint32_t ext, off;
-	size_t n;
-	uint8_t data[];
-} stash_t;
-
-/*
- * Per-file reassembly for hashing: the digest must see a file's bytes in
- * logical order, but physical order can deliver them out of order. In-order
- * bytes are hashed at once; early ones wait in the stash. Holes and uninit
- * extents are hashed as zeros when the cursor reaches them.
- */
-typedef struct {
-	hstate hs;
-	uint64_t pos;	/* logical bytes hashed so far */
-	uint32_t cur;	/* extent the cursor is in, relative to the file's first */
-	uint32_t done;
-	stash_t *stash;
-} fstate;
-
-static uint32_t g_bs;
-static fstate *g_fs;
-static uint64_t g_stash_bytes, g_stash_peak;
-
-static int cmp_piece(const void *a, const void *b)
-{
-	uint64_t x = ((const piece_t *)a)->pblk, y = ((const piece_t *)b)->pblk;
-	return (x > y) - (x < y);
-}
-
-static void fs_advance(uint32_t fi)
-{
-	const fent *f = &g_fl[fi];
-	fstate *st = &g_fs[fi];
-	while (!st->done) {
-		const ext_t *e = &g_ex[f->first + st->cur];
-		uint64_t lstart, lend;
-		if (st->cur == f->n || (lstart = e->lblk * g_bs) >= f->size) {
-			h_zeros(&st->hs, f->size - st->pos);	/* trailing hole */
-			add_record(f->ino, f->size, h_final(&st->hs));
-			st->done = 1;
-			break;
-		}
-		lend = (e->lblk + e->len) * g_bs;
-		lend = lend < f->size ? lend : f->size;
-		if (st->pos < lstart) {	/* hole */
-			h_zeros(&st->hs, lstart - st->pos);
-			st->pos = lstart;
-		} else if (e->uninit) {
-			h_zeros(&st->hs, lend - st->pos);
-			st->pos = lend;
-			st->cur++;
-		} else if (st->pos >= lend) {
-			st->cur++;
-		} else {
-			break;	/* waiting for this extent's data */
-		}
-	}
-}
-
-static void deliver(const piece_t *p, const uint8_t *data, size_t n)
-{
-	fstate *st = &g_fs[p->file];
-	uint32_t rel = p->ext - (uint32_t)g_fl[p->file].first;
-	if (rel != st->cur || (g_ex[p->ext].lblk + p->off) * g_bs != st->pos) {
-		stash_t *s = malloc(sizeof *s + n);
-		if (!s)
-			die("out of memory");
-		s->ext = rel;
-		s->off = p->off;
-		s->n = n;
-		memcpy(s->data, data, n);
-		s->next = st->stash;
-		st->stash = s;
-		g_stash_bytes += n;
-		if (g_stash_bytes > g_stash_peak)
-			g_stash_peak = g_stash_bytes;
-		return;
-	}
-	h_update(&st->hs, data, n);
-	st->pos += n;
-	fs_advance(p->file);
-	for (;;) {	/* drain whatever was waiting for this */
-		stash_t **pp = &st->stash, *s;
-		const fent *f = &g_fl[p->file];
-		while ((s = *pp) && !(s->ext == st->cur && (g_ex[f->first + s->ext].lblk + s->off) * g_bs == st->pos))
-			pp = &s->next;
-		if (!s)
-			break;
-		*pp = s->next;
-		h_update(&st->hs, s->data, s->n);
-		st->pos += s->n;
-		g_stash_bytes -= s->n;
-		free(s);
-		fs_advance(p->file);
-	}
-}
+#define PBLK(x) ((x).pblk)
+RADIX_DEFINE(sort_pieces, piece_t, PBLK)
 
 static void m_rawsort(const char *dev)
 {
 	uint32_t bs;
 	int fd = raw_parse(dev, &bs);
 	uint32_t maxblk = BUFSZ / bs;
-	piece_t *pc = NULL;
+	piece_t *pc = NULL, *tmp;
 	size_t np = 0, cap = 0;
-	g_bs = bs;
 
 	/* plan: every initialised extent inside EOF, cut to <= 1 MiB, sorted by disk address */
 	for (size_t fi = 0; fi < g_nfl; fi++) {
@@ -982,26 +1085,30 @@ static void m_rawsort(const char *dev)
 			die("%s", dump);
 		exit(0);
 	}
-	qsort(pc, np, sizeof *pc, cmp_piece);
+	if (!(tmp = malloc((np ? np : 1) * sizeof *tmp)))
+		die("out of memory");
+	sort_pieces(pc, np, tmp);
+	free(tmp);
 	if (g_hash) {
-		if (!(g_fs = calloc(g_nfl, sizeof *g_fs)))
-			die("out of memory");
-		uint64_t t0 = now_ns();	/* hashing leading holes is read work, as in raw */
-		for (uint32_t fi = 0; fi < g_nfl; fi++) {
-			h_init(&g_fs[fi].hs);
-			fs_advance(fi);	/* empty and all-hole files finish here */
-		}
+		uint64_t t0 = now_ns();	/* empty and all-hole files are hashed here, as in raw */
+		for (size_t fi = 0; fi < g_nfl; fi++)
+			hf_open(g_fl[fi].ino, g_fl[fi].size, data_bytes(bs, &g_fl[fi]));	/* fid == fi */
 		g_read_ns += now_ns() - t0;
 	}
 
-	/* read: one pread per run of physically adjacent pieces, whichever files they belong to */
+	/*
+	 * read: one pread per run of physically adjacent pieces, whichever files
+	 * they belong to. Each piece goes to its file's hash as it arrives: no
+	 * piece waits for another, whatever order the disk gives them in.
+	 */
 	for (size_t i = 0; i < np;) {
 		uint64_t start = pc[i].pblk, nb = pc[i].nblk;
 		size_t j = i + 1;
 		while (j < np && pc[j].pblk == start + nb && nb + pc[j].nblk <= maxblk)
 			nb += pc[j++].nblk;
 		uint64_t t0 = now_ns();
-		pread_full(fd, g_buf, nb * bs, start * bs);
+		uint8_t *buf = hb_buf(nb * bs);
+		pread_full(fd, buf, nb * bs, start * bs);
 		if (g_hash) {
 			for (size_t k = i; k < j; k++) {
 				const fent *f = &g_fl[pc[k].file];
@@ -1009,24 +1116,16 @@ static void m_rawsort(const char *dev)
 				uint64_t n = (uint64_t)pc[k].nblk * bs;
 				if (n > f->size - lstart)
 					n = f->size - lstart;	/* the file ends inside this piece */
-				deliver(&pc[k], g_buf + (pc[k].pblk - start) * bs, n);
+				deliver(pc[k].file, lstart, buf + (pc[k].pblk - start) * bs, n);
 			}
+			hb_used(nb * bs);
 		}
 		g_read_ns += now_ns() - t0;
 		i = j;
 	}
-	if (g_hash) {
+	if (!g_hash)
 		for (size_t fi = 0; fi < g_nfl; fi++)
-			if (!g_fs[fi].done) {
-				errno = 0;
-				die("ino %" PRIu64 ": data never completed", g_fl[fi].ino);
-			}
-		if (g_stash_peak)
-			fprintf(stderr, "accbench: rawsort held back at most %" PRIu64 " bytes for reordering\n", g_stash_peak);
-	} else {
-		for (size_t fi = 0; fi < g_nfl; fi++)
-			add_record(g_fl[fi].ino, g_fl[fi].size, 0);
-	}
+			add_record(g_fl[fi].ino, g_fl[fi].size, NULL);
 	free(pc);
 	close(fd);
 }
@@ -1046,6 +1145,12 @@ int main(int argc, char **argv)
 			return 0;
 		} else if (!strcmp(argv[i], "--hash")) {
 			g_hash = 1;
+		} else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
+			g_threads = (unsigned)atoi(argv[++i]);
+			if (g_threads < 1 || g_threads > 1024) {
+				method = NULL;
+				break;
+			}
 		} else if (!strcmp(argv[i], "--digest") && i + 1 < argc) {
 			digest = argv[++i];
 			g_hash = 1;
@@ -1060,12 +1165,19 @@ int main(int argc, char **argv)
 	}
 	if (!method || !target) {
 		fprintf(stderr, "usage: accbench {vfs|handle|bulkstat|e2fs|raw|rawsort} TARGET [--hash] [--digest FILE]\n"
+				"                [--threads N]\n"
 				"       accbench --header\n");
 		return 2;
 	}
 	if (posix_memalign((void **)&g_buf, 4096, BUFSZ))
 		die("out of memory");
 	memset(g_buf, 0, BUFSZ);	/* fault the buffer in before timing */
+	if (g_threads > 1 && g_hash) {	/* the pool's threads start before timing too */
+		g_arena_sz = (size_t)2 * g_threads * BUFSZ;
+		if (posix_memalign((void **)&g_arena, 4096, g_arena_sz) || !(g_pool = pool_new(g_threads)))
+			die("out of memory");
+		memset(g_arena, 0, g_arena_sz);
+	}
 
 	uint64_t t0 = now_ns();
 	if (!strcmp(method, "vfs"))
@@ -1084,7 +1196,17 @@ int main(int argc, char **argv)
 		errno = 0;
 		die("unknown method %s", method);
 	}
+	if (g_hash) {
+		uint64_t t1 = now_ns();
+		hb_flush();	/* the last batch, and the files it completes */
+		g_read_ns += now_ns() - t1;
+	}
 	uint64_t total = now_ns() - t0;
+	for (size_t i = 0; i < g_nhf; i++)
+		if (!g_hf[i].done) {
+			errno = 0;
+			die("ino %" PRIu64 ": data never completed", g_hf[i].ino);
+		}
 
 	struct rusage ru;
 	getrusage(RUSAGE_SELF, &ru);
@@ -1099,10 +1221,18 @@ int main(int argc, char **argv)
 		FILE *o = fopen(digest, "w");
 		if (!o)
 			die("fopen %s", digest);
-		qsort(g_recs, g_nrecs, sizeof *g_recs, cmp_rec);
+		rec_t *tmp = malloc((g_nrecs ? g_nrecs : 1) * sizeof *tmp);
+		if (!tmp)
+			die("out of memory");
+		sort_recs(g_recs, g_nrecs, tmp);
+		free(tmp);
 		fprintf(o, "# files=%" PRIu64 " names=%" PRIu64 " bytes=%" PRIu64 "\n", g_files, g_names, g_bytes);
-		for (size_t i = 0; i < g_nrecs; i++)
-			fprintf(o, "%" PRIu64 " %" PRIu64 " %016" PRIx64 "\n", g_recs[i].ino, g_recs[i].size, g_recs[i].digest);
+		for (size_t i = 0; i < g_nrecs; i++) {
+			fprintf(o, "%" PRIu64 " %" PRIu64 " ", g_recs[i].ino, g_recs[i].size);
+			for (unsigned k = 0; k < B3_OUT; k++)
+				fprintf(o, "%02x", g_recs[i].digest[k]);
+			fputc('\n', o);
+		}
 		if (fclose(o))
 			die("write %s", digest);
 	}

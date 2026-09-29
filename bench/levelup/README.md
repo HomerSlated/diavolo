@@ -234,12 +234,105 @@ Build it with `cargo build --release --offline`, and use `--profile small` for
 Rust's smallest build. `b3tree/rust` also has `--features lean` (no AVX-512 or
 SSE2 kernels).
 
-## Not done here (needs a go-ahead)
+## In accbench (2026-09-29)
 
-- **Putting `b3tree`, radix and pool into `accbench`,** in both languages.
-  That's P1.1, P2.2 and P2.4 of the advisor's report. Today accbench's content
-  hash is still the 64-bit fingerprint.
+All three are now inside [`../access`](../access/README.md#hashing) in both
+languages:
+
+- **Hashing:** every `--hash` digest is BLAKE3 of the file, built from subtree
+  CVs in any arrival order.
+- **Sorting:** `rawsort`'s plan and `handle`'s inode order use the radix sort,
+  from `sort/radix.h` in C and a copy of it in Rust.
+- **Threads:** `--threads N` hashes on N threads, through `pool/` in C and a
+  Rust port of it (`../access/rust/src/pool.rs`). Rayon was tried first; see
+  below.
+
+### Checks
+
+- **The digest gate.** Every ext4 image was run with `raw`, `e2fs` and
+  `rawsort`, in gcc, clang and Rust, at 1 and at 12 threads: 198 runs, all
+  byte-identical. That includes `rawsort` against `raw`, whose arrival orders
+  are completely different.
+- **The `vfs` method** was checked on `/usr/share/doc` (12,594 files): all six
+  runs are identical, and every digest equals `b3sum` of the file.
+- **Independent oracle, `debugfs cat` piped to `b3sum`:**
+  - both 2 GiB huge files;
+  - 330 files on `real-aged` and 366 on `mixed-aged-random`, including 33
+    sparse files and 117 multi-extent files.
+
+  Every one matched. The generator never makes uninitialised extents, so that
+  path is untested; the merge treats it exactly as it treats holes.
+- **ThreadSanitizer:** clean at 12 threads, C build.
+- **Read patterns are unchanged.** `strace` counts of `pread64` and `read` are
+  identical between the old (`1ee22aa`) and new binaries:
+  - for `raw`, `e2fs` and `rawsort` on `real-aged`, with and without `--hash`,
+    at 1 and 12 threads;
+  - for `vfs` on `/usr/share/doc`.
+- **Not run:** the root harness methods `handle` and `bulkstat` (loop mounts).
+  They've only been compiled. `doas bench/access/run.sh verify` checks them.
+
+### Timings
+
+**Conditions.** These are page-cache runs on the image files, `--hash`, median
+of 3. They are *not* the harness's loop-device regimes, and cold isn't
+measured.
+
+| set, method | old C / Rust (fingerprint) | new C / Rust, 1 thread | new C / Rust, 12 threads | maxrss old → new (1 thread) |
+|---|---|---|---|---|
+| huge-aged, rawsort | 1.321 / 1.154 s | 0.593 / 0.602 s | 0.456 / 0.459 s | 1,978 → 2 MiB |
+| real-aged, rawsort | 0.798 / 0.788 s | 0.990 / 1.003 s | 0.756 / 0.798 s | 171 → 24 MiB |
+| real-aged, raw | 0.712 / 0.714 s | 0.989 / 1.002 s | 0.740 / 0.771 s | 12 → 20 MiB |
+| tiny-aged, raw | 0.099 / 0.100 s | 0.227 / 0.230 s | 0.133 / 0.133 s | 10 → 18 MiB |
+| small-aged, rawsort | 0.265 / 0.264 s | 0.362 / 0.368 s | 0.260 / 0.271 s | 7 → 8 MiB |
+
+**What the timings show:**
+
+- **Cost of the stronger hash.** On one thread, BLAKE3 is 1.3–2.3× slower
+  than the old fingerprint, and worst on tiny files, where per-file hashing
+  can't use SIMD across chunks. 12 threads recover most of it.
+- **`rawsort` without the stash** is both faster and about a thousand times
+  smaller in memory on fragmented huge files.
+- **C and Rust single-threaded** are level, within 1–2 %.
+
+**Two findings along the way:**
+
+1. **Rust's first arena was 25 % slower, and threads weren't the cause.** It
+   was a `Vec<u8>`, and glibc returns large blocks 16 bytes past a page
+   boundary. Every 1 MiB `pread` into it cost 180–223 µs, against 127 µs into
+   C's `posix_memalign(4096)` arena: the kernel's copy is slow to a destination
+   that isn't even cache-line aligned. A page-aligned allocation fixed it. 64-
+   and 4096-byte alignment measured the same.
+2. **Rayon's idle workers yield in a spin loop before sleeping.** That gives
+   thousands of `sched_yield`s and involuntary switches per run, against about
+   30 for C. On this SMT CPU they slow the reading thread.
+   - **Tested:** a 126-line Rust port of `pool.c` (std threads, mutex +
+     condvar, atomic index) matched C exactly: real-aged `rawsort` at 12
+     threads took 0.757 s, the same as C, where rayon took 0.802 s.
+   - **Size:** 513 KB stripped against rayon's 570 KB.
+   - **Adopted** (kgr, 2026-09-29): accbench's Rust now uses the port, with
+     `map_into` for the hashing. Re-gated on every image at 1 and 12 threads;
+     real-aged `rawsort` at 12 threads is 0.755 s against C's 0.757 s.
+
+**Sizes, stripped:**
+
+| | before | now |
+|---|---|---|
+| C accbench (gcc) | 105 KB | 76 KB |
+| Rust accbench (pool port) | 484 KB | 513 KB |
+| Rust accbench with rayon (not kept) | — | 570 KB |
+
+- **Why C shrank.** Its old 64 KB zero array sat in `.rodata`. Our 1 MiB one
+  is writable, so it lands in `.bss`.
+- **Why Rust nearly doubled first.** Its first version put its 1 MiB zeros in
+  `.rodata`, at 1.6 MB. Interior mutability moved them to `.bss`.
+- **Kernel choice.** C picks its kernels at compile time (`-march=native`);
+  Rust dispatches at run time.
+
+## Not done here
+
 - **Run detection in the C radix sort,** for nearly-sorted plans.
 - **A NEON build for aarch64.**
 - **An m68k cross-build of `port`,** to see the Amiga size and stack use for
   real.
+- **Overlapping reads with hashing** (report P2.4 proper): today the arena
+  fills, then hashes, while reading waits.

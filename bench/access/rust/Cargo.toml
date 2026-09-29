@@ -6,6 +6,7 @@ publish = false
 description = "Storage access-method benchmark, Rust peer of ../c/accbench.c"
 
 [dependencies]
+blake3 = "=1.8.7"
 libc = "0.2"
 
 # Parity with the C build: one codegen unit (like one translation unit), no

@@ -5,11 +5,11 @@ CFLAGS = -O3 -march=native -std=gnu11 -Wall -Wextra -Werror
 
 all: build/sortbench-gcc build/sortbench-clang rust/target/release/sortbench
 
-build/sortbench-gcc: sortbench.c
+build/sortbench-gcc: sortbench.c radix.h
 	@mkdir -p build
 	gcc $(CFLAGS) -o $@ $<
 
-build/sortbench-clang: sortbench.c
+build/sortbench-clang: sortbench.c radix.h
 	@mkdir -p build
 	clang $(CFLAGS) -o $@ $<
 

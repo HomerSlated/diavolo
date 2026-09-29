@@ -22,6 +22,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "radix.h"
+
 typedef struct {	/* as in accbench.c */
 	uint64_t pblk;
 	uint32_t nblk, file, ext, off;
@@ -131,7 +133,10 @@ static void s_intro(piece_t *a, size_t n)
 	intro(a, n, depth);
 }
 
-/* ---- radix ---- */
+/* ---- radix (radix.h, the version accbench uses) ---- */
+
+#define PBLK(x) ((x).pblk)
+RADIX_DEFINE(radix_piece, piece_t, PBLK)
 
 static int sorted(const piece_t *a, size_t n)
 {
@@ -154,36 +159,7 @@ static piece_t *g_tmp;
 
 static void s_radix(piece_t *a, size_t n)
 {
-	if (sorted(a, n))
-		return;
-	uint64_t all = 0;
-	for (size_t i = 0; i < n; i++)
-		all |= a[i].pblk;
-	int w, passes = plan_digits(all, &w);
-	uint32_t mask = (1u << w) - 1;
-	static uint32_t h[6][2048];
-	memset(h, 0, sizeof h);
-	for (size_t i = 0; i < n; i++)
-		for (int p = 0; p < passes; p++)
-			h[p][(a[i].pblk >> (p * w)) & mask]++;
-	piece_t *src = a, *dst = g_tmp;
-	for (int p = 0; p < passes; p++) {
-		uint32_t *c = h[p], sum = 0;
-		if (c[(src[0].pblk >> (p * w)) & mask] == n)
-			continue;	/* every key has the same digit here */
-		for (uint32_t d = 0; d <= mask; d++) {
-			uint32_t k = c[d];
-			c[d] = sum;
-			sum += k;
-		}
-		for (size_t i = 0; i < n; i++)
-			dst[c[(src[i].pblk >> (p * w)) & mask]++] = src[i];
-		piece_t *t = src;
-		src = dst;
-		dst = t;
-	}
-	if (src != a)
-		memcpy(a, src, n * sizeof *a);
+	radix_piece(a, n, g_tmp);
 }
 
 /* ---- pack: radix over (pblk << 24 | index), then gather ---- */

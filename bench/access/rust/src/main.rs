@@ -1,7 +1,9 @@
 //! accbench — storage access-method benchmark, Rust implementation.
 //!
 //! A line-for-line peer of ../c/accbench.c: same methods, same syscalls, same
-//! buffer size, same hash, same output. See ../README.md.
+//! buffer size, same hash, same output. Where C uses its own BLAKE3 tree layer,
+//! radix sort and thread pool, Rust uses blake3::hazmat and ports of the
+//! radix sort and the pool. See ../README.md.
 //!
 //!   accbench vfs      MOUNTPOINT   method 1: lstat + open + read by path
 //!   accbench handle   MOUNTPOINT   method 2: walk, name_to_handle_at, inode order, open_by_handle_at
@@ -15,19 +17,21 @@ mod common;
 mod e2fs;
 mod ext4;
 mod handle;
+mod pool;
 mod sys;
 mod vfs;
 
 use std::io::Write;
 use std::time::Instant;
 
-use common::{Ctx, die};
+use common::{Ctx, die, radix_sort};
 
 const CSV_HEADER: &str = "impl,method,files,names,bytes,find_ns,read_ns,total_ns,utime_us,stime_us,\
                           minflt,majflt,inblock,nvcsw,nivcsw,maxrss_kb,combined";
 
 fn main() {
     let (mut method, mut target, mut digest, mut hash) = (None, None, None, false);
+    let mut threads = 1usize;
     let mut args = std::env::args().skip(1);
     let mut bad = false;
     while let Some(a) = args.next() {
@@ -37,6 +41,10 @@ fn main() {
                 return;
             }
             "--hash" => hash = true,
+            "--threads" => match args.next().and_then(|t| t.parse().ok()) {
+                Some(t @ 1..=1024) => threads = t,
+                _ => bad = true,
+            },
             "--digest" => match args.next() {
                 Some(f) => {
                     digest = Some(f);
@@ -51,12 +59,12 @@ fn main() {
     }
     let (Some(method), Some(target), false) = (method, target, bad) else {
         eprintln!(
-            "usage: accbench {{vfs|handle|bulkstat|e2fs|raw|rawsort}} TARGET [--hash] [--digest FILE]\n       accbench --header"
+            "usage: accbench {{vfs|handle|bulkstat|e2fs|raw|rawsort}} TARGET [--hash] [--digest FILE]\n                [--threads N]\n       accbench --header"
         );
         std::process::exit(2);
     };
 
-    let mut ctx = Ctx::new(hash);
+    let mut ctx = Ctx::new(hash, threads);
     let t0 = Instant::now();
     match method.as_str() {
         "vfs" => vfs::run(&mut ctx, &target),
@@ -67,7 +75,13 @@ fn main() {
         "rawsort" => ext4::run_rawsort(&mut ctx, &target),
         m => die(format_args!("unknown method {m}")),
     }
+    if hash {
+        let t1 = Instant::now();
+        ctx.flush(); // the last batch, and the files it completes
+        ctx.read_ns += t1.elapsed().as_nanos() as u64;
+    }
     let total = t0.elapsed().as_nanos() as u64;
+    ctx.check_complete();
 
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
@@ -91,7 +105,7 @@ fn main() {
     );
 
     if let Some(path) = digest {
-        ctx.recs.sort_unstable_by_key(|r| r.ino);
+        radix_sort(&mut ctx.recs, |r| r.ino);
         let f = std::fs::File::create(&path)
             .unwrap_or_else(|e| die(format_args!("create {path}: {e}")));
         let mut o = std::io::BufWriter::new(f);
@@ -102,7 +116,11 @@ fn main() {
                 ctx.files, ctx.names, ctx.bytes
             )?;
             for r in &ctx.recs {
-                writeln!(o, "{} {} {:016x}", r.ino, r.size, r.digest)?;
+                write!(o, "{} {} ", r.ino, r.size)?;
+                for b in r.digest {
+                    write!(o, "{b:02x}")?;
+                }
+                writeln!(o)?;
             }
             o.flush()
         })();

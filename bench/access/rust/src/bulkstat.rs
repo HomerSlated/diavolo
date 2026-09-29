@@ -111,11 +111,13 @@ pub fn run(ctx: &mut Ctx, mnt: &str) {
         if f < 0 {
             die_os(format_args!("open ino {}", r.ino));
         }
-        let (n, dg) = ctx.read_stream(f);
+        let n = ctx.read_stream(f, r.ino, r.size);
         if n != r.size {
             die(format_args!("ino {}: short read", r.ino));
         }
-        ctx.add_record(r.ino, n, dg);
+        if !ctx.hash {
+            ctx.add_record(r.ino, n, [0; 32]);
+        }
         unsafe { libc::close(f) };
     }
 }

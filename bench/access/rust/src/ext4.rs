@@ -4,7 +4,7 @@
 use std::ffi::{CString, c_int};
 use std::time::Instant;
 
-use crate::common::{BUFSZ, Ctx, Hasher, die, die_os, errno};
+use crate::common::{BUFSZ, Ctx, die, die_os, errno, radix_sort};
 
 pub struct Ext {
     pub lblk: u64,
@@ -54,33 +54,34 @@ pub fn pread_full(fd: c_int, mut buf: &mut [u8], mut off: u64) {
     }
 }
 
-/// Read one file's extents in logical order, merging runs that are contiguous on disk.
-fn xfer_file(ctx: &mut Ctx, fd: c_int, bs: u64, f: &Fent, ex: &[Ext]) {
-    let (mut pos, size) = (0u64, f.size);
-    let mut hs = Hasher::new();
+/// Bytes of a file that live in initialised extents inside EOF: what reading it delivers.
+fn data_bytes(bs: u64, f: &Fent, ex: &[Ext]) -> u64 {
+    ex[f.first..f.first + f.n]
+        .iter()
+        .filter(|e| !e.uninit && e.lblk * bs < f.size)
+        .map(|e| ((e.lblk + e.len as u64) * bs).min(f.size) - e.lblk * bs)
+        .sum()
+}
+
+/// Read one file's extents in logical order, merging runs that are contiguous
+/// on disk. Holes and uninitialised extents are never read; the hash merge
+/// counts them as zeros.
+fn xfer_file(ctx: &mut Ctx, fd: c_int, bs: u64, f: &Fent, all: &[Ext]) {
+    let ex = &all[f.first..f.first + f.n];
+    let size = f.size;
+    let mut fid = 0;
+    if ctx.hash {
+        let t0 = Instant::now(); // an empty or all-hole file is hashed here
+        fid = ctx.hf_open(f.ino, size, data_bytes(bs, f, all));
+        ctx.read_ns += t0.elapsed().as_nanos() as u64;
+    }
     let mut i = 0;
     while i < ex.len() {
         let lstart = ex[i].lblk * bs;
         if lstart >= size {
             break;
         }
-        if lstart > pos {
-            // hole: never read, only hashed as zeros
-            if ctx.hash {
-                let t0 = Instant::now();
-                hs.zeros(lstart - pos);
-                ctx.read_ns += t0.elapsed().as_nanos() as u64;
-            }
-            pos = lstart;
-        }
         if ex[i].uninit {
-            let end = ((ex[i].lblk + ex[i].len as u64) * bs).min(size);
-            if ctx.hash {
-                let t0 = Instant::now();
-                hs.zeros(end - pos);
-                ctx.read_ns += t0.elapsed().as_nanos() as u64;
-            }
-            pos = end;
             i += 1;
             continue;
         }
@@ -91,13 +92,15 @@ fn xfer_file(ctx: &mut Ctx, fd: c_int, bs: u64, f: &Fent, ex: &[Ext]) {
             j += 1;
         }
         let end = ((lb + nb) * bs).min(size);
-        let mut off = pb * bs + (pos - lb * bs);
+        let (mut pos, mut off) = (lstart, pb * bs);
         while pos < end {
             let chunk = ((end - pos) as usize).min(BUFSZ);
             let t0 = Instant::now();
-            pread_full(fd, &mut ctx.buf[..chunk], off);
+            let at = ctx.hb_buf(chunk);
+            pread_full(fd, ctx.region(at, chunk), off);
             if ctx.hash {
-                hs.update(&ctx.buf[..chunk]);
+                ctx.deliver(fid, pos, at, chunk);
+                ctx.hb_used(chunk);
             }
             ctx.read_ns += t0.elapsed().as_nanos() as u64;
             off += chunk as u64;
@@ -105,19 +108,14 @@ fn xfer_file(ctx: &mut Ctx, fd: c_int, bs: u64, f: &Fent, ex: &[Ext]) {
         }
         i = j;
     }
-    if pos < size && ctx.hash {
-        // trailing hole
-        let t0 = Instant::now();
-        hs.zeros(size - pos);
-        ctx.read_ns += t0.elapsed().as_nanos() as u64;
+    if !ctx.hash {
+        ctx.add_record(f.ino, size, [0; 32]);
     }
-    let dg = if ctx.hash { hs.finish() } else { 0 };
-    ctx.add_record(f.ino, size, dg);
 }
 
 pub fn xfer_all(ctx: &mut Ctx, fd: c_int, bs: u32, p: &Parsed) {
     for f in &p.files {
-        xfer_file(ctx, fd, bs as u64, f, &p.ex[f.first..f.first + f.n]);
+        xfer_file(ctx, fd, bs as u64, f, &p.ex);
     }
 }
 
@@ -321,104 +319,13 @@ pub fn run_raw(ctx: &mut Ctx, dev: &str) {
 
 // ---- method 3c: hand-written ext4 reader, every extent of every file in physical order ----
 
+#[derive(Clone, Copy)]
 struct Piece {
     pblk: u64,
     nblk: u32, // at most BUFSZ / bs
     file: u32, // index into Parsed::files
     ext: u32,  // index into Parsed::ex
     off: u32,  // first block of this piece within its extent
-}
-
-struct Stashed {
-    ext: u32, // relative to the file's first extent
-    off: u32,
-    data: Vec<u8>,
-}
-
-/// Per-file reassembly for hashing: the digest must see a file's bytes in
-/// logical order, but physical order can deliver them out of order. In-order
-/// bytes are hashed at once; early ones wait in the stash. Holes and uninit
-/// extents are hashed as zeros when the cursor reaches them.
-struct FState {
-    hs: Hasher,
-    pos: u64, // logical bytes hashed so far
-    cur: u32, // extent the cursor is in, relative to the file's first
-    done: bool,
-    stash: Vec<Stashed>,
-}
-
-struct Sorted<'a> {
-    p: &'a Parsed,
-    bs: u64,
-    fs: Vec<FState>,
-    stash_bytes: u64,
-    stash_peak: u64,
-}
-
-impl Sorted<'_> {
-    fn advance(&mut self, ctx: &mut Ctx, fi: usize) {
-        let f = &self.p.files[fi];
-        let st = &mut self.fs[fi];
-        while !st.done {
-            let k = st.cur as usize;
-            if k == f.n || self.p.ex[f.first + k].lblk * self.bs >= f.size {
-                st.hs.zeros(f.size - st.pos); // trailing hole
-                ctx.add_record(f.ino, f.size, st.hs.finish());
-                st.done = true;
-                break;
-            }
-            let e = &self.p.ex[f.first + k];
-            let lstart = e.lblk * self.bs;
-            let lend = ((e.lblk + e.len as u64) * self.bs).min(f.size);
-            if st.pos < lstart {
-                st.hs.zeros(lstart - st.pos); // hole
-                st.pos = lstart;
-            } else if e.uninit {
-                st.hs.zeros(lend - st.pos);
-                st.pos = lend;
-                st.cur += 1;
-            } else if st.pos >= lend {
-                st.cur += 1;
-            } else {
-                break; // waiting for this extent's data
-            }
-        }
-    }
-
-    fn deliver(&mut self, ctx: &mut Ctx, pc: &Piece, data: &[u8]) {
-        let fi = pc.file as usize;
-        let first = self.p.files[fi].first;
-        let rel = pc.ext - first as u32;
-        let st = &mut self.fs[fi];
-        if rel != st.cur || (self.p.ex[pc.ext as usize].lblk + pc.off as u64) * self.bs != st.pos {
-            st.stash.push(Stashed {
-                ext: rel,
-                off: pc.off,
-                data: data.to_vec(),
-            });
-            self.stash_bytes += data.len() as u64;
-            self.stash_peak = self.stash_peak.max(self.stash_bytes);
-            return;
-        }
-        st.hs.update(data);
-        st.pos += data.len() as u64;
-        self.advance(ctx, fi);
-        loop {
-            // drain whatever was waiting for this
-            let (p, bs) = (self.p, self.bs);
-            let st = &mut self.fs[fi];
-            let Some(i) = st.stash.iter().position(|s| {
-                s.ext == st.cur && (p.ex[first + s.ext as usize].lblk + s.off as u64) * bs == st.pos
-            }) else {
-                break;
-            };
-            let s = st.stash.swap_remove(i);
-            st.hs.update(&s.data);
-            st.pos += s.data.len() as u64;
-            self.stash_bytes -= s.data.len() as u64;
-            self.advance(ctx, fi);
-        }
-    }
 }
 
 pub fn run_rawsort(ctx: &mut Ctx, dev: &str) {
@@ -449,34 +356,18 @@ pub fn run_rawsort(ctx: &mut Ctx, dev: &str) {
             }
         }
     }
-    pc.sort_unstable_by_key(|x| x.pblk);
-    let mut so = Sorted {
-        p: &p,
-        bs: bs64,
-        fs: Vec::new(),
-        stash_bytes: 0,
-        stash_peak: 0,
-    };
+    radix_sort(&mut pc, |x| x.pblk);
     if ctx.hash {
-        let t0 = Instant::now(); // hashing leading holes is read work, as in raw
-        so.fs = (0..p.files.len())
-            .map(|_| FState {
-                hs: Hasher::new(),
-                pos: 0,
-                cur: 0,
-                done: false,
-                stash: Vec::new(),
-            })
-            .collect();
-        for fi in 0..p.files.len() {
-            so.advance(ctx, fi); // empty and all-hole files finish here
+        let t0 = Instant::now(); // empty and all-hole files are hashed here, as in raw
+        for f in &p.files {
+            ctx.hf_open(f.ino, f.size, data_bytes(bs64, f, &p.ex)); // fid == file index
         }
         ctx.read_ns += t0.elapsed().as_nanos() as u64;
     }
 
-    // read: one pread per run of physically adjacent pieces, whichever files they belong to.
-    // The buffer leaves ctx for the loop so deliver() can take &mut ctx without a copy.
-    let buf = std::mem::take(&mut ctx.buf);
+    // read: one pread per run of physically adjacent pieces, whichever files
+    // they belong to. Each piece goes to its file's hash as it arrives: no
+    // piece waits for another, whatever order the disk gives them in.
     let mut i = 0;
     while i < pc.len() {
         let (start, mut nb) = (pc[i].pblk, pc[i].nblk as u64);
@@ -487,37 +378,24 @@ pub fn run_rawsort(ctx: &mut Ctx, dev: &str) {
         }
         let t0 = Instant::now();
         let len = (nb * bs64) as usize;
-        pread_full(fd, &mut buf[..len], start * bs64);
+        let at = ctx.hb_buf(len);
+        pread_full(fd, ctx.region(at, len), start * bs64);
         if ctx.hash {
-            let run = &buf[..len];
             for x in &pc[i..j] {
                 let f = &p.files[x.file as usize];
                 let lstart = (p.ex[x.ext as usize].lblk + x.off as u64) * bs64;
                 let n = (x.nblk as u64 * bs64).min(f.size - lstart) as usize; // the file may end inside this piece
                 let o = ((x.pblk - start) * bs64) as usize;
-                so.deliver(ctx, x, &run[o..o + n]);
+                ctx.deliver(x.file as usize, lstart, at + o, n);
             }
+            ctx.hb_used(len);
         }
         ctx.read_ns += t0.elapsed().as_nanos() as u64;
         i = j;
     }
-    ctx.buf = buf;
-    if ctx.hash {
-        if let Some(fi) = so.fs.iter().position(|s| !s.done) {
-            die(format_args!(
-                "ino {}: data never completed",
-                p.files[fi].ino
-            ));
-        }
-        if so.stash_peak != 0 {
-            eprintln!(
-                "accbench: rawsort held back at most {} bytes for reordering",
-                so.stash_peak
-            );
-        }
-    } else {
+    if !ctx.hash {
         for f in &p.files {
-            ctx.add_record(f.ino, f.size, 0);
+            ctx.add_record(f.ino, f.size, [0; 32]);
         }
     }
     unsafe { libc::close(fd) };
